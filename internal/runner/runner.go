@@ -100,19 +100,21 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintf(stderr, "cover: skipping standard or vendor package %s\n", pkg.ImportPath)
 			continue
 		}
-		if len(pkg.GoFiles)+len(pkg.CgoFiles) == 0 {
-			fmt.Fprintf(stderr, "cover: skipping package %s: no non-test Go files\n", pkg.ImportPath)
-			continue
-		}
 		if pkg.ImportPath == "command-line-arguments" {
 			return errors.New("cover: provide package patterns, not individual Go files")
+		}
+		// A test-only package may exercise production code in another selected
+		// package. Keep it in the test invocation even though it needs no overlay.
+		testPackages = append(testPackages, pkg.ImportPath)
+		if len(pkg.GoFiles)+len(pkg.CgoFiles) == 0 {
+			fmt.Fprintf(stderr, "cover: not instrumenting %s: no non-test Go files (tests will still run)\n", pkg.ImportPath)
+			continue
 		}
 		coverage, err := preparePackage(pkg, tempDir, len(covered), overlay.Replace)
 		if err != nil {
 			return err
 		}
 		covered = append(covered, coverage)
-		testPackages = append(testPackages, pkg.ImportPath)
 	}
 	if len(covered) == 0 {
 		return errors.New("cover: no instrumentable non-test Go files in requested packages")
