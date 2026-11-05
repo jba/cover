@@ -64,10 +64,10 @@ func TestLineDirectiveUsesPhysicalPositions(t *testing.T) {
 
 func TestRejectedInput(t *testing.T) {
 	for _, tc := range []struct{ name, src, prefix, contains string }{
-		{"goto", "package p; func f(){ L: goto L }", "__c", "goto"},
 		{"invalid", "package p; func f(", "__c", ""},
 		{"prefix", "package p", "for", "prefix"},
 		{"collision", "package p; var __cHit int", "__c", "collision"},
+		{"local collision", "package p; func f(){ var __cLocal1 int; _ = __cLocal1; for {break} }", "__c", "collision"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			n := 0

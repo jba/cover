@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // Position is a 1-based source line and byte column.
@@ -47,6 +48,17 @@ type instrumenter struct {
 	points   []Point
 	edits    []insertion
 	serial   int
+	fn       *function
+}
+
+// Labels have function scope. Bookkeeping for a labelled statement normally
+// precedes its labels, so a goto must replay that bookkeeping before jumping.
+// Keep this separate from statement traversal to handle forward references.
+type function struct {
+	labels   map[string]ast.Stmt
+	gotos    []*ast.BranchStmt
+	preludes map[ast.Stmt]string
+	locals   []string
 }
 
 // Instrument inserts references to prefix+Hit(int) and prefix+Bool(int,int,bool).
@@ -64,12 +76,8 @@ func Instrument(filename string, src []byte, prefix string, nextCounter *int) ([
 	var unsupported error
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch n := n.(type) {
-		case *ast.BranchStmt:
-			if n.Tok == token.GOTO {
-				unsupported = fmt.Errorf("%s: goto is not yet supported", fs.Position(n.Pos()))
-			}
 		case *ast.Ident:
-			if n.Name == prefix+"Hit" || n.Name == prefix+"Bool" {
+			if strings.HasPrefix(n.Name, prefix) {
 				unsupported = fmt.Errorf("%s: instrumentation identifier collision", fs.Position(n.Pos()))
 			}
 		}
@@ -83,10 +91,10 @@ func Instrument(filename string, src []byte, prefix string, nextCounter *int) ([
 		switch n := n.(type) {
 		case *ast.FuncDecl:
 			if n.Body != nil {
-				in.block(n.Body)
+				in.function(n.Body)
 			}
 		case *ast.FuncLit:
-			in.block(n.Body)
+			in.function(n.Body)
 		}
 		return true
 	})
@@ -119,7 +127,60 @@ func (in *instrumenter) point(kind, construct, outcome string, start, end token.
 func (in *instrumenter) hit(id int) string { return in.prefix + "Hit(" + strconv.Itoa(id) + ");" }
 func (in *instrumenter) local() string {
 	in.serial++
-	return fmt.Sprintf("%sLocal%d", in.prefix, in.serial)
+	name := fmt.Sprintf("%sLocal%d", in.prefix, in.serial)
+	in.fn.locals = append(in.fn.locals, name)
+	return name
+}
+
+func (in *instrumenter) function(body *ast.BlockStmt) {
+	fn := &function{
+		labels:   make(map[string]ast.Stmt),
+		preludes: make(map[ast.Stmt]string),
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.FuncLit:
+			// The outer AST walk instruments this function separately.
+			return false
+		case *ast.LabeledStmt:
+			target := n.Stmt
+			for {
+				label, ok := target.(*ast.LabeledStmt)
+				if !ok {
+					break
+				}
+				target = label.Stmt
+			}
+			fn.labels[n.Label.Name] = target
+		case *ast.BranchStmt:
+			if n.Tok == token.GOTO {
+				fn.gotos = append(fn.gotos, n)
+			}
+		}
+		return true
+	})
+	old := in.fn
+	in.fn = fn
+	// Reserve the insertion before walking the body: declarations must precede
+	// other edits at the same offset (e.g. func f(){for ...}).
+	declarations := len(in.edits)
+	in.insert(body.Lbrace+1, "")
+	in.block(body)
+	for _, name := range fn.locals {
+		// Predeclared bool/true/false may be shadowed by original declarations.
+		in.edits[declarations].text += "var " + name + "=0!=0;"
+	}
+	for _, g := range fn.gotos {
+		// Insert at the goto keyword, not before its labels: a goto can itself
+		// be a jump target and must still replay its outgoing target's prelude.
+		in.insert(g.Pos(), fn.preludes[fn.labels[g.Label.Name]])
+	}
+	in.fn = old
+}
+
+func (in *instrumenter) prelude(s ast.Stmt, anchor token.Pos, text string) {
+	in.fn.preludes[s] += text
+	in.insert(anchor, text)
 }
 func (in *instrumenter) block(b *ast.BlockStmt) {
 	for _, s := range b.List {
@@ -155,7 +216,7 @@ func (in *instrumenter) stmt(s ast.Stmt, anchor token.Pos) {
 		end = n.Body.Lbrace
 	}
 	id := in.point("statement", "", "", s.Pos(), end)
-	in.insert(anchor, in.hit(id))
+	in.prelude(s, anchor, in.hit(id))
 	switch n := s.(type) {
 	case *ast.IfStmt:
 		t := in.point("branch", "if", "true", n.Cond.Pos(), n.Cond.End())
@@ -175,13 +236,13 @@ func (in *instrumenter) stmt(s ast.Stmt, anchor token.Pos) {
 			}
 		}
 	case *ast.ForStmt:
-		in.loop(n.Pos(), n.End(), anchor, n.Body, n.Cond != nil)
+		in.loop(n, anchor, n.Body, n.Cond != nil)
 	case *ast.RangeStmt:
-		in.loop(n.Pos(), n.End(), anchor, n.Body, true)
+		in.loop(n, anchor, n.Body, true)
 	case *ast.SwitchStmt:
-		in.clauses("switch", n.Pos(), n.End(), anchor, n.Body)
+		in.clauses("switch", n, anchor, n.Body)
 	case *ast.TypeSwitchStmt:
-		in.clauses("type-switch", n.Pos(), n.End(), anchor, n.Body)
+		in.clauses("type-switch", n, anchor, n.Body)
 	case *ast.SelectStmt:
 		for _, s := range n.Body.List {
 			c := s.(*ast.CommClause)
@@ -198,21 +259,19 @@ func (in *instrumenter) stmt(s ast.Stmt, anchor token.Pos) {
 	}
 }
 
-func (in *instrumenter) loop(start, end, anchor token.Pos, body *ast.BlockStmt, canSkip bool) {
+func (in *instrumenter) loop(s ast.Stmt, anchor token.Pos, body *ast.BlockStmt, canSkip bool) {
 	flag := in.local()
-	in.insert(anchor, "{var "+flag+" bool;")
-	entry := in.point("branch", "for", "entered", start, body.Lbrace)
-	in.insert(body.Lbrace+1, "if !"+flag+" {"+flag+"=true;"+in.hit(entry)+"};")
+	in.prelude(s, anchor, flag+"=0!=0;")
+	entry := in.point("branch", "for", "entered", s.Pos(), body.Lbrace)
+	in.insert(body.Lbrace+1, "if !"+flag+" {"+flag+"=0==0;"+in.hit(entry)+"};")
 	in.block(body)
 	if canSkip {
-		skipped := in.point("branch", "for", "skipped", start, body.Lbrace)
-		in.insert(end, ";if !"+flag+" {"+in.hit(skipped)+"};}")
-	} else {
-		in.insert(end, "}")
+		skipped := in.point("branch", "for", "skipped", s.Pos(), body.Lbrace)
+		in.insert(s.End(), ";if !"+flag+" {"+in.hit(skipped)+"};")
 	}
 }
 
-func (in *instrumenter) clauses(construct string, start, end, anchor token.Pos, body *ast.BlockStmt) {
+func (in *instrumenter) clauses(construct string, s ast.Stmt, anchor token.Pos, body *ast.BlockStmt) {
 	hasDefault := false
 	for _, s := range body.List {
 		if s.(*ast.CaseClause).List == nil {
@@ -222,7 +281,7 @@ func (in *instrumenter) clauses(construct string, start, end, anchor token.Pos, 
 	flag := ""
 	if !hasDefault {
 		flag = in.local()
-		in.insert(anchor, "{var "+flag+" bool;")
+		in.prelude(s, anchor, flag+"=0!=0;")
 	}
 	for _, s := range body.List {
 		c := s.(*ast.CaseClause)
@@ -233,7 +292,7 @@ func (in *instrumenter) clauses(construct string, start, end, anchor token.Pos, 
 		id := in.point("branch", construct, outcome, c.Pos(), c.Colon+1)
 		text := in.hit(id)
 		if flag != "" {
-			text = flag + "=true;" + text
+			text = flag + "=0==0;" + text
 		}
 		in.insert(c.Colon+1, text)
 		for _, s := range c.Body {
@@ -241,7 +300,7 @@ func (in *instrumenter) clauses(construct string, start, end, anchor token.Pos, 
 		}
 	}
 	if flag != "" {
-		id := in.point("branch", construct, "no-match", start, body.Lbrace)
-		in.insert(end, ";if !"+flag+" {"+in.hit(id)+"};}")
+		id := in.point("branch", construct, "no-match", s.Pos(), body.Lbrace)
+		in.insert(s.End(), ";if !"+flag+" {"+in.hit(id)+"};")
 	}
 }

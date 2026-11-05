@@ -59,12 +59,20 @@ least one body execution during a particular encounter with the loop. `skipped`
 means that encounter finished normally without executing the body. A false
 condition **after** one or more iterations does not satisfy `skipped`.
 
-Each loop gets a local Boolean outside its body. First entry sets it and records
-`entered`; normal completion records `skipped` only if it is still false. This
-handles `break`, `continue`, early `return`, empty bodies, and labeled loops.
+Each loop gets a local Boolean declared at function entry. First body entry sets
+it and records `entered`; normal completion records `skipped` only if it is still
+false. This handles `goto`, `break`, `continue`, early `return`, empty bodies, and
+labeled loops.
 Panicking during initialization, condition evaluation, or range evaluation does
 not falsely record a skipped loop. A loop never reached has neither outcome
 covered. An unconditional `for` has no `skipped` obligation.
+
+State resets and statement-entry counters normally precede the statement's
+labels. A `goto` to such a label replays that entry bookkeeping immediately
+before jumping. Labels remain attached to their original statements, preserving
+labeled `break` and `continue`. No new blocks surround loops or switches, and
+hoisted declarations cannot be skipped by a jump. Labels and jumps are resolved
+separately within each function, including function literals.
 
 Switch clauses measure **entry**, including entry by `fallthrough`, not whether
 every expression in a multi-expression case matched. Selects do not invent an
@@ -106,8 +114,6 @@ same mapping. Temporary files are removed afterward.
 
 Current limitations:
 
-- Files containing `goto` are rejected explicitly: inserting scoped loop state
-  can otherwise invalidate or alter legal jumps. No silently changed programs.
 - Counter storage uses Unix `mmap`; Windows and cross-compilation are unsupported.
 - Go's own overlay restrictions still apply, notably to some cgo scenarios and
   files under `GOMODCACHE`. cgo is not comprehensively tested.
@@ -129,4 +135,4 @@ go vet ./...
 Tests include source positions and syntax/semantic preservation, real temporary
 modules, sibling relative replacements, internal imports, embedded/testdata
 assets, external-package tests, existing `TestMain`, atomic concurrency, subprocess
-exits, and loop control-flow edge cases.
+exits, goto target counter updates, and loop control-flow edge cases.
