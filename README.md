@@ -86,7 +86,8 @@ evaluation, but does **not** establish separate coverage of `a` and `b` in
 Existing `GOFLAGS` and Go environment settings remain in effect. The tool
 instruments only the requested packages' non-test Go source, not dependencies
 unless also selected. Standard-library and vendored packages are skipped.
-Test-only packages without production source are not instrumented.
+Test-only packages without production source are not instrumented, but their
+tests still run and can exercise the selected production packages.
 
 ## Implementation and limitations
 
