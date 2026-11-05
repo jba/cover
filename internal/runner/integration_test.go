@@ -789,6 +789,49 @@ func TestValue(t *testing.T) { if Value(true) != 1 { t.Fatal("wrong result") } }
 	}
 }
 
+func TestTestOnlyPackageExercisesSelectedLibrary(t *testing.T) {
+	// The library has no tests of its own. Dropping the test-only package from
+	// go test's targets would silently leave every library point uncovered.
+	f := newFixture(t, map[string]string{
+		"go.mod": fixtureMod,
+		"lib/value.go": `package lib
+func Value(yes bool) int {
+	if yes {
+		return 1
+	}
+	return 0
+}
+`,
+		"integration/value_test.go": `package integration_test
+import (
+	"os"
+	"testing"
+	"example.com/fixture/lib"
+)
+func TestLibrary(t *testing.T) {
+	if lib.Value(true) != 1 || lib.Value(false) != 0 {
+		t.Fatal("library results changed")
+	}
+	if err := os.WriteFile(os.Getenv("COVER_FIXTURE_TEST_ONLY_MARKER"), []byte("ran\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+`,
+	}, ".")
+	marker := filepath.Join(t.TempDir(), "test-only-package-ran")
+	t.Setenv("COVER_FIXTURE_TEST_ONLY_MARKER", marker)
+	if points := f.success(t, "./..."); len(points) != 0 {
+		t.Errorf("test-only package should cover all library points, got %+v", points)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("test-only package did not run: %v", err)
+	}
+	if string(data) != "ran\n" {
+		t.Errorf("test-only package marker = %q, want ran", data)
+	}
+}
+
 func TestFailedTestsAndTimeoutReturnErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name, body string
