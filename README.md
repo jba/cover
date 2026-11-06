@@ -17,6 +17,23 @@ cover -run TestParse -race -o uncovered.jsonl ./parser
 From a checkout, use `go run . [flags] [packages]`. Package patterns default to
 `.`. Flags must precede package patterns.
 
+## Flags
+
+```
+-o file       JSONL destination (default stdout; '-' also means stdout)
+-run regexp   Select tests using go test's -run
+-count n      Test repetitions (default 1, bypassing cached test results)
+-timeout d    Forward a test timeout, e.g. 30s
+-tags tags    Build tags, applied to package discovery and testing
+-race         Enable Go's race detector for discovery and testing
+```
+
+Existing `GOFLAGS` and Go environment settings remain in effect. The tool
+instruments only the requested packages' non-test Go source, not dependencies
+unless also selected. Standard-library and vendored packages are skipped.
+Test-only packages without production source are not instrumented, but their
+tests still run and can exercise the selected production packages.
+
 ## Output
 
 Only uncovered points are emitted. Test output and diagnostics go to stderr;
@@ -81,23 +98,6 @@ every expression in a multi-expression case matched. Selects do not invent an
 implicit default branch. Whole-condition branch coverage preserves short-circuit
 evaluation, but does **not** establish separate coverage of `a` and `b` in
 `a || b`; condition/MC/DC coverage is not implemented.
-
-## Flags
-
-```
--o file       JSONL destination (default stdout; '-' also means stdout)
--run regexp   Select tests using go test's -run
--count n      Test repetitions (default 1, bypassing cached test results)
--timeout d    Forward a test timeout, e.g. 30s
--tags tags    Build tags, applied to package discovery and testing
--race         Enable Go's race detector for discovery and testing
-```
-
-Existing `GOFLAGS` and Go environment settings remain in effect. The tool
-instruments only the requested packages' non-test Go source, not dependencies
-unless also selected. Standard-library and vendored packages are skipped.
-Test-only packages without production source are not instrumented, but their
-tests still run and can exercise the selected production packages.
 
 ## Implementation and limitations
 
