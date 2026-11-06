@@ -295,9 +295,34 @@ func Value() int { return 21 }
 }
 
 func TestExistingTestMain(t *testing.T) {
-	for _, mode := range []string{"return", "os.Exit"} {
-		t.Run(mode, func(t *testing.T) {
-			const src = `package fixture
+	for _, tc := range []struct {
+		name, imports, body string
+	}{
+		{"return", "", "m.Run()"},
+		{"os.Exit", `import "os"`, "os.Exit(m.Run())"},
+		{"deferred os.Exit", `import "os"`, "defer os.Exit(0); m.Run()"},
+		{"aliased Exit", `import process "os"`, "process.Exit(m.Run())"},
+		{"dot Exit", `import . "os"`, "Exit(m.Run())"},
+		{
+			"shadowed os", `import "os"; var _ = os.Args`,
+			`os := struct{ Exit func(string) }{func(s string) { if s != "shadow" { panic(s) } }}; os.Exit("shadow"); m.Run()`,
+		},
+		{
+			"shadowed alias", `import process "os"; var _ = process.Args`,
+			`process := struct{ Exit func(string) }{func(s string) { if s != "shadow" { panic(s) } }}; process.Exit("shadow"); m.Run()`,
+		},
+		{
+			"shadowed dot Exit", `import . "os"; var _ = Args`,
+			`Exit := func(s string) { if s != "shadow" { panic(s) } }; Exit("shadow"); m.Run()`,
+		},
+	} {
+		for _, external := range []bool{false, true} {
+			name := tc.name
+			if external {
+				name += "/external"
+			}
+			t.Run(name, func(t *testing.T) {
+				const src = `package fixture
 func Value(yes bool) int {
 	if yes {
 		return 1
@@ -305,28 +330,30 @@ func Value(yes bool) int {
 	return 0
 }
 `
-			mainBody := "m.Run()"
-			importOS := ""
-			if mode == "os.Exit" {
-				mainBody = "os.Exit(m.Run())"
-				importOS = `import "os"`
-			}
-			f := newFixture(t, map[string]string{
-				"go.mod":   fixtureMod,
-				"value.go": src,
-				"value_test.go": fmt.Sprintf(`package fixture
+				packageName, importFixture, value := "fixture", "", "Value"
+				if external {
+					packageName = "fixture_test"
+					importFixture = `import "example.com/fixture"`
+					value = "fixture.Value"
+				}
+				f := newFixture(t, map[string]string{
+					"go.mod":   fixtureMod,
+					"value.go": src,
+					"value_test.go": fmt.Sprintf(`package %s
 import "testing"
+%s
 %s
 func TestMain(m *testing.M) { %s }
 func TestValue(t *testing.T) {
-	if Value(true) != 1 { t.Fatal("wrong value") }
+	if %s(true) != 1 { t.Fatal("wrong value") }
 }
-`, importOS, mainBody),
-			}, ".")
-			points := f.success(t)
-			wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "true", false)
-			wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "false", true)
-		})
+`, packageName, importFixture, tc.imports, tc.body, value),
+				}, ".")
+				points := f.success(t)
+				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "true", false)
+				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "false", true)
+			})
+		}
 	}
 }
 
@@ -833,6 +860,12 @@ func TestLibrary(t *testing.T) {
 }
 
 func TestFailedTestsAndTimeoutReturnErrors(t *testing.T) {
+	const src = `package fixture
+func Value(yes bool) int {
+	if yes { return 1 }
+	return 0
+}
+`
 	for _, tc := range []struct {
 		name, body string
 		args       []string
@@ -843,7 +876,7 @@ func TestFailedTestsAndTimeoutReturnErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t, map[string]string{
 				"go.mod":   fixtureMod,
-				"value.go": "package fixture\nfunc Value() int { return 1 }\n",
+				"value.go": src,
 				"value_test.go": fmt.Sprintf(`package fixture
 import (
 	"fmt"
@@ -852,15 +885,21 @@ import (
 )
 var _ = fmt.Println
 var _ = time.Second
-func TestFailure(t *testing.T) { %s }
+func TestFailure(t *testing.T) { Value(true); %s }
 `, tc.body),
 			}, ".")
 			out, diagnostic, err := f.run(t, tc.args...)
 			if err == nil {
 				t.Fatalf("Run succeeded for %s\nstderr: %s", tc.name, diagnostic)
 			}
-			// A runner may still report coverage collected before failure.
-			decodePoints(t, out)
+			points := decodePoints(t, out)
+			if tc.name == "failure" {
+				// t.Fatal still lets m.Run and TestMain complete normally.
+				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "true", false)
+				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "false", true)
+			}
+			// A timeout may bypass TestMain's save. Only require a valid
+			// partial report, not recovery of the interrupted test's hits.
 			if !strings.Contains(diagnostic, "FAIL") {
 				t.Errorf("missing go test failure diagnostics on stderr:\n%s", diagnostic)
 			}
