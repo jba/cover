@@ -46,7 +46,26 @@ func prepareTestMain(pkg listedPackage, prefix, registryImport, tempDir string, 
 	if found {
 		return nil
 	}
-	src, err := testMainSource(pkg.Name, prefix, registryImport)
+	// TestMain(*testing.T) is an ordinary test, not the harness hook. Keep its
+	// name (and hence -run behavior) intact by using the other test namespace.
+	// Production declarations share the internal test package's namespace too.
+	internal := append(append(append([]string(nil), pkg.GoFiles...), pkg.CgoFiles...), pkg.TestGoFiles...)
+	occupied, err := declaresTestMain(pkg.Dir, internal)
+	if err != nil {
+		return err
+	}
+	packageName := pkg.Name
+	if occupied {
+		externalOccupied, err := declaresTestMain(pkg.Dir, pkg.XTestGoFiles)
+		if err != nil {
+			return err
+		}
+		if externalOccupied {
+			return fmt.Errorf("cover: unsupported TestMain declarations in %s: both %s and %s_test declare TestMain without a TestMain(*testing.M) hook; cannot add a coverage-saving hook without renaming existing declarations", pkg.ImportPath, pkg.Name, pkg.Name)
+		}
+		packageName += "_test"
+	}
+	src, err := testMainSource(packageName, prefix, registryImport)
 	if err != nil {
 		return err
 	}
@@ -60,6 +79,42 @@ func prepareTestMain(pkg listedPackage, prefix, registryImport, tempDir string, 
 	}
 	overlay[virtual] = backing
 	return nil
+}
+
+// declaresTestMain checks only active source files supplied by go list. Methods
+// and local declarations do not occupy the package-level TestMain name.
+func declaresTestMain(dir string, files []string) (bool, error) {
+	for _, name := range files {
+		filename := filepath.Join(dir, name)
+		f, err := parser.ParseFile(token.NewFileSet(), filename, nil, parser.AllErrors)
+		if err != nil {
+			return false, fmt.Errorf("parse source %s: %w", filename, err)
+		}
+		for _, decl := range f.Decls {
+			switch decl := decl.(type) {
+			case *ast.FuncDecl:
+				if decl.Recv == nil && decl.Name.Name == "TestMain" {
+					return true, nil
+				}
+			case *ast.GenDecl:
+				for _, spec := range decl.Specs {
+					switch spec := spec.(type) {
+					case *ast.TypeSpec:
+						if spec.Name.Name == "TestMain" {
+							return true, nil
+						}
+					case *ast.ValueSpec:
+						for _, name := range spec.Names {
+							if name.Name == "TestMain" {
+								return true, nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return false, nil
 }
 
 func testMainPath(dir, name string, overlay map[string]string) (string, error) {
@@ -114,6 +169,18 @@ func rewriteTestMain(filename string, src []byte, alias, registryImport string) 
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Recv != nil || fn.Name.Name != "TestMain" {
 			continue
+		}
+		// Match cmd/go/internal/load/test.go: it first accepts *T as an
+		// ordinary test, then checks for the *M harness signature. This is a
+		// syntactic check, deliberately independent of import/type resolution.
+		if hasTestMainSignature(fn, "T") {
+			continue
+		}
+		if !hasTestMainSignature(fn, "M") {
+			return nil, false, fmt.Errorf("%s: wrong signature for TestMain, must be func TestMain(m *testing.M)", filename)
+		}
+		if fn.Type.TypeParams.NumFields() > 0 {
+			return nil, false, fmt.Errorf("%s: TestMain cannot have type parameters", filename)
 		}
 		if main != nil {
 			return nil, false, fmt.Errorf("%s: multiple TestMain functions", filename)
@@ -192,6 +259,26 @@ func rewriteTestMain(filename string, src []byte, alias, registryImport string) 
 		return true
 	})
 	return applyTestMainEdits(src, edits), true, nil
+}
+
+// hasTestMainSignature follows cmd/go's isTestFunc, including unnamed parameters,
+// import aliases, and dot imports. Aliases whose name isn't T or M are not
+// accepted merely because they resolve to the corresponding testing type.
+func hasTestMainSignature(fn *ast.FuncDecl, name string) bool {
+	if fn.Type.Results.NumFields() > 0 || fn.Type.Params.NumFields() != 1 {
+		return false
+	}
+	ptr, ok := fn.Type.Params.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	switch typ := ptr.X.(type) {
+	case *ast.Ident:
+		return typ.Name == name
+	case *ast.SelectorExpr:
+		return typ.Sel.Name == name
+	}
+	return false
 }
 
 func applyTestMainEdits(src []byte, edits []testMainEdit) []byte {
