@@ -8,21 +8,6 @@ import (
 // Goto tests must not run in parallel: the fixture helpers change the working
 // directory. success checks JSONL and snapshots every original fixture file.
 
-func wantGotoStatement(t *testing.T, points []point, file, src, marker string, want bool) {
-	t.Helper()
-	line := sourceLine(t, src, marker)
-	var found []point
-	for _, p := range points {
-		if p.File == file && p.Kind == "statement" && p.Range.Start.Line == line {
-			found = append(found, p)
-		}
-	}
-	if (len(found) != 0) != want || len(found) > 1 {
-		t.Errorf("%s:%d statement: found %d uncovered points, want present=%v\npoints: %+v",
-			file, line, len(found), want, points)
-	}
-}
-
 func TestGotoLoopReentry(t *testing.T) {
 	const srcTemplate = `package fixture
 
@@ -100,6 +85,7 @@ func TestLoops(t *testing.T) {
 			}, ".")
 			points := f.success(t, "-timeout", "15s")
 			file := f.path("goto.go")
+			wantBuiltinBlocks(t, f, points, "-timeout", "15s")
 			for _, check := range []struct {
 				marker           string
 				entered, skipped bool
@@ -111,15 +97,11 @@ func TestLoops(t *testing.T) {
 			} {
 				wantBranch(t, points, file, src, check.marker, "for", "entered", check.entered)
 				wantBranch(t, points, file, src, check.marker, "for", "skipped", check.skipped)
-				wantGotoStatement(t, points, file, src, check.marker, false)
 			}
 			// Resetting on reentry matters especially when an earlier entry set
 			// the flag true and the subsequent entry has no body iterations.
 			wantBranch(t, points, file, src, "// infinite-target", "for", "entered", false)
 			wantBranch(t, points, file, src, "// infinite-target", "for", "skipped", false)
-			wantGotoStatement(t, points, file, src, "// infinite-target", false)
-			wantGotoStatement(t, points, file, src, "// skipped-prelude", true)
-			wantGotoStatement(t, points, file, src, "// zero-body", true)
 		})
 	}
 }
@@ -225,9 +207,9 @@ func TestLabels(t *testing.T) {
 	}, ".")
 	points := f.success(t, "-timeout", "15s")
 	file := f.path("goto.go")
+	wantBuiltinBlocks(t, f, points, "-timeout", "15s")
 	wantBranch(t, points, file, src, "// adjacent-loop", "for", "entered", false)
 	wantBranch(t, points, file, src, "// adjacent-loop", "for", "skipped", false)
-	wantGotoStatement(t, points, file, src, "// adjacent-loop", false)
 	// Wrapping a labelled loop in a block would make these break/continue
 	// targets invalid. A goto leaving a loop must not manufacture a skip.
 	for _, marker := range []string{
@@ -236,21 +218,15 @@ func TestLabels(t *testing.T) {
 	} {
 		wantBranch(t, points, file, src, marker, "for", "entered", false)
 		wantBranch(t, points, file, src, marker, "for", "skipped", true)
-		wantGotoStatement(t, points, file, src, marker, false)
 	}
 	for _, marker := range []string{"// jumped-for", "// jumped-range"} {
 		wantBranch(t, points, file, src, marker, "for", "entered", true)
 		wantBranch(t, points, file, src, marker, "for", "skipped", true)
-		wantGotoStatement(t, points, file, src, marker, true)
 	}
 	wantBranch(t, points, file, src, "// jumped-switch", "switch", "no-match", true)
 	wantBranch(t, points, file, src, "// jumped-case", "switch", "case", true)
 	wantBranch(t, points, file, src, "// jumped-type-switch", "type-switch", "no-match", true)
 	wantBranch(t, points, file, src, "// jumped-type-case", "type-switch", "case", true)
-	wantGotoStatement(t, points, file, src, "// jumped-switch", true)
-	wantGotoStatement(t, points, file, src, "// jumped-type-switch", true)
-	wantGotoStatement(t, points, file, src, "// jumped-return", false)
-	wantGotoStatement(t, points, file, src, "// leave-loop-return", false)
 }
 
 func TestGotoSwitchReentry(t *testing.T) {
@@ -372,6 +348,7 @@ func TestSwitches(t *testing.T) {
 	}, ".")
 	points := f.success(t, "-timeout", "15s")
 	file := f.path("goto.go")
+	wantBuiltinBlocks(t, f, points, "-timeout", "15s")
 	for _, tc := range []struct {
 		header, matched, unmatched, construct string
 		noMatch                               bool
@@ -381,7 +358,6 @@ func TestSwitches(t *testing.T) {
 		{"// leave-switch\n", "// leave-switch-matched", "// leave-switch-unmatched", "switch", true},
 		{"// leave-type\n", "// leave-type-matched", "// leave-type-unmatched", "type-switch", true},
 	} {
-		wantGotoStatement(t, points, file, src, tc.header, false)
 		wantBranch(t, points, file, src, tc.header, tc.construct, "no-match", tc.noMatch)
 		wantBranch(t, points, file, src, tc.matched, tc.construct, "case", false)
 		wantBranch(t, points, file, src, tc.unmatched, tc.construct, "case", true)
@@ -390,11 +366,9 @@ func TestSwitches(t *testing.T) {
 		{"// switch-no-match", "// switch-never-matched", "switch"},
 		{"// type-no-match", "// type-never-matched", "type-switch"},
 	} {
-		wantGotoStatement(t, points, file, src, tc.header, false)
 		wantBranch(t, points, file, src, tc.header, tc.construct, "no-match", false)
 		wantBranch(t, points, file, src, tc.unmatched, tc.construct, "case", true)
 	}
-	wantGotoStatement(t, points, file, src, "// break-switch\n", false)
 	wantBranch(t, points, file, src, "// break-switch\n", "switch", "no-match", false)
 	wantBranch(t, points, file, src, "// break-switch-matched", "switch", "case", false)
 	wantBranch(t, points, file, src, "// break-switch-default", "switch", "default", true)
@@ -500,19 +474,8 @@ func TestTargets(t *testing.T) {
 	}, ".")
 	points := f.success(t, "-timeout", "15s")
 	file := f.path("goto.go")
-	// Conditions and select cases can execute even if the statement's own hit
-	// was placed before its label. Assert both kinds of coverage separately.
-	for _, marker := range []string{
-		"// assignment-target", "// if-target", "// select-target",
-		"// goto-target", "// goto-chain-loop", "// block-target-body", "// after-empty-target",
-	} {
-		wantGotoStatement(t, points, file, src, marker, false)
-	}
-	for _, marker := range []string{
-		"// assignment-skipped", "// terminal-skipped", "// untaken-goto", "// untaken-target",
-	} {
-		wantGotoStatement(t, points, file, src, marker, true)
-	}
+	wantBuiltinBlocks(t, f, points, "-timeout", "15s")
+	// A goto may skip a native block header while its branch executes.
 	wantBranch(t, points, file, src, "// if-target", "if", "true", false)
 	wantBranch(t, points, file, src, "// if-target", "if", "false", true)
 	wantBranch(t, points, file, src, "// select-matched", "select", "case", false)
@@ -573,11 +536,9 @@ func TestNamespaces(t *testing.T) {
 	}, ".")
 	points := f.success(t, "-timeout", "15s")
 	file := f.path("goto.go")
+	wantBuiltinBlocks(t, f, points, "-timeout", "15s")
 	// All three functions use Target, but it names a different statement kind
-	// in each. Replay must never refer to another function's local flag.
-	wantGotoStatement(t, points, file, src, "// nested-target", false)
-	wantGotoStatement(t, points, file, src, "// literal-loop", false)
-	wantGotoStatement(t, points, file, src, "// namespace-switch", false)
+	// in each. Branch-state reset must never use another function's local flag.
 	wantBranch(t, points, file, src, "// literal-loop", "for", "entered", false)
 	wantBranch(t, points, file, src, "// literal-loop", "for", "skipped", false)
 	wantBranch(t, points, file, src, "// namespace-switch", "switch", "no-match", false)
