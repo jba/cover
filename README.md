@@ -3,9 +3,10 @@
 `cover` runs Go tests and reports **uncovered statements and branch outcomes** as
 JSONL. It instruments source through a Go build overlay: package import paths,
 module/workspace context, relative `replace` directives, and original files stay
-unchanged. Shared counters use atomic increments.
+unchanged on disk. Counters use atomic increments; saved snapshots are merged
+across test binaries.
 
-Requires Go 1.24 or later. Currently runs on Linux and macOS; Linux is tested.
+Requires Go 1.24 or later and module mode. The runtime is pure Go; Linux is tested.
 
 ```sh
 go install github.com/jba/cover@latest
@@ -40,9 +41,10 @@ stdout is exclusively JSONL unless `-o` names an output file.
 
 An empty report means all instrumented obligations were observed, **provided
 that the command succeeded**. Missing coverage does not make the command fail;
-listing, instrumentation, build, and test errors do. Available coverage is still
-reported after a test failure, timeout, or abnormal exit; such a report is partial
-and must not be treated as a successful coverage run.
+listing, instrumentation, build, and test errors do. Snapshots that were saved
+are still reported after a test failure, timeout, or abnormal exit; such a report
+is partial and must not be treated as a successful coverage run. A process that
+does not reach its save path can lose all its coverage.
 
 ## Branch obligations
 
@@ -101,20 +103,40 @@ tests still run and can exercise the selected production packages.
 
 The tool parses original ASTs and inserts bookkeeping without reformatting source.
 It allocates IDs and physical source ranges before instrumentation. Rewritten
-files and a generated per-package runtime are supplied with `go test -overlay`.
-Non-Go assets, embedded files, internal imports, and external-package tests still
-see the original package directory and identity. Existing `TestMain` functions
-are untouched.
+files, per-package runtimes, and a small shared registry package are supplied with
+`go test -overlay`. Non-Go assets, embedded files, internal imports, and
+external-package tests still see the original package directory and identity.
+The registry is a virtual public subdirectory of a selected module; it has no
+files on disk and adds no module requirements.
 
-The generated runtime atomically increments aligned uint64 counters in temporary
-shared-memory-mapped files. The driver reads them after `go test` exits; there is
-no exit hook, JSON emitted by the test binary, or dependence on a flush before
-`os.Exit`. Packages used by multiple selected test binaries aggregate into the
-same mapping. Temporary files are removed afterward.
+Each package keeps an ordinary in-memory array of `atomic.Uint64` counters. At
+test completion, the registry saves each loaded instrumented package's counters
+as JSON, using atomic loads to take the snapshot. Test-only packages also get a
+save path, so their tests can contribute coverage to selected libraries.
+
+If there is no `TestMain`, the tool generates one that runs `m.Run()`, saves, and
+exits. An existing `TestMain` instead gets a deferred save for normal return, and
+direct calls to the imported `os.Exit` inside its body are rewritten to save
+before exiting. Import aliases and dot imports are supported; shadowed identifiers
+are left alone. Deferred and goroutine exit calls retain their execution timing.
+Existing test setup, teardown, return behavior, and exit codes are preserved
+unless saving fails, in which case the command fails with a diagnostic.
+
+Each package and process has its own snapshot file. Repeated saves by one process
+replace its previous snapshot rather than double-counting it. The driver merges
+snapshots from separate test binaries and subprocesses after `go test` exits.
+Temporary files are removed afterward. No mmap, unsafe code, or runtime exit
+hooks are used.
 
 Current limitations:
 
-- Counter storage uses Unix `mmap`; Windows and cross-compilation are unsupported.
+- Panics, timeouts, and direct exits outside `TestMain` may prevent saving.
+  Calls through exit-function aliases or helpers outside `TestMain` are not
+  intercepted. This tool does not install Go's internal runtime exit hooks.
+- Automatic vet is disabled for the instrumented test run: vet cannot use a
+  virtual registry directory as its working directory. Run `go vet ./...`
+  separately on the original source.
+- GOPATH mode is not supported.
 - Go's own overlay restrictions still apply, notably to some cgo scenarios and
   files under `GOMODCACHE`. cgo is not comprehensively tested.
 - A test must not leave background processes running past test completion; their
