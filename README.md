@@ -1,12 +1,25 @@
 # cover
 
 `cover` runs Go tests and reports **uncovered statements and branch outcomes** as
-JSONL. It instruments source through a Go build overlay: package import paths,
-module/workspace context, relative `replace` directives, and original files stay
-unchanged on disk. Counters use atomic increments; saved snapshots are merged
-across test binaries.
+JSONL.
 
-Requires Go 1.24 or later and module mode. The runtime is pure Go; Linux is tested.
+Go's built-in coverage measures statements, not branch outcomes. For example:
+
+```go
+func abs(n int) int {
+	if n < 0 {
+		n = -n
+	}
+	return n
+}
+```
+
+A test that calls only `abs(-1)` gives this function 100% built-in statement
+coverage: the `if` body and the `return` both execute. But the condition is never
+false, so the path that skips the body is untested. `cover` reports that missing
+`false` outcome at `n < 0`.
+
+Requires Go 1.26 or later and module mode. The runtime is pure Go; Linux is tested.
 
 ```sh
 go install github.com/jba/cover@latest
@@ -100,6 +113,11 @@ evaluation, but does **not** establish separate coverage of `a` and `b` in
 `a || b`; condition/MC/DC coverage is not implemented.
 
 ## Implementation and limitations
+
+It instruments source through a Go build overlay: package import paths,
+module/workspace context, relative `replace` directives, and original files stay
+unchanged on disk. Counters use atomic increments; saved snapshots are merged
+across test binaries.
 
 The tool parses original ASTs and inserts bookkeeping without reformatting source.
 It allocates IDs and physical source ranges before instrumentation. Rewritten
