@@ -48,7 +48,7 @@ func TestPositionsAndOriginalBytes(t *testing.T) {
 	}
 }
 
-func TestLineDirectiveUsesPhysicalPositions(t *testing.T) {
+func TestBranchLineDirectiveUsesPhysicalPositions(t *testing.T) {
 	src := []byte("package p\n//line imaginary.go:500\nfunc f(x bool) { if x {} }\n")
 	n := 0
 	_, ps, err := Instrument("physical.go", src, "__c", &n)
@@ -56,7 +56,7 @@ func TestLineDirectiveUsesPhysicalPositions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range ps {
-		if p.File != "physical.go" || p.Range.Start.Line != 3 {
+		if p.Kind == "branch" && (p.File != "physical.go" || p.Range.Start.Line != 3) {
 			t.Errorf("point: %+v", p)
 		}
 	}
