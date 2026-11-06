@@ -39,12 +39,11 @@ type sourceRange struct {
 }
 
 type point struct {
-	File       string      `json:"file"`
-	Kind       string      `json:"kind"`
-	Construct  string      `json:"construct,omitempty"`
-	Outcome    string      `json:"outcome,omitempty"`
-	Statements int         `json:"statements,omitempty"`
-	Range      sourceRange `json:"range"`
+	File      string      `json:"file"`
+	Kind      string      `json:"kind"`
+	Construct string      `json:"construct,omitempty"`
+	Outcome   string      `json:"outcome,omitempty"`
+	Range     sourceRange `json:"range"`
 }
 
 type fixture struct {
@@ -149,14 +148,6 @@ func (f fixture) success(t *testing.T, args ...string) []point {
 // go test's diagnostics, summaries, and user output did not leak onto stdout.
 func decodePoints(t *testing.T, output string) []point {
 	t.Helper()
-	return decodePointsWithLineDirectives(t, output, false)
-}
-
-// Native statement positions follow the selected Go toolchain's interpretation
-// of //line directives. Older toolchains can report virtual lines and column 0;
-// branch positions always remain physical byte positions.
-func decodePointsWithLineDirectives(t *testing.T, output string, lineDirectives bool) []point {
-	t.Helper()
 	var points []point
 	seen := map[point]bool{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
@@ -181,9 +172,6 @@ func decodePointsWithLineDirectives(t *testing.T, output string, lineDirectives 
 		if p.Kind == "branch" && (p.Construct == "" || p.Outcome == "") {
 			t.Fatalf("branch lacks construct/outcome: %+v", p)
 		}
-		if p.Statements < 0 || (p.Kind == "branch" && p.Statements != 0) {
-			t.Fatalf("invalid native statement weight: %+v", p)
-		}
 		if !filepath.IsAbs(p.File) {
 			t.Fatalf("coverage filename is not an original absolute path: %+v", p)
 		}
@@ -193,22 +181,14 @@ func decodePointsWithLineDirectives(t *testing.T, output string, lineDirectives 
 		}
 		lines := bytes.Split(src, []byte("\n"))
 		for _, pos := range []position{p.Range.Start, p.Range.End} {
-			if lineDirectives && p.Kind == "statement" {
-				if pos.Line < 1 || pos.Column < 0 {
-					t.Fatalf("invalid native //line position %+v in %+v", pos, p)
-				}
-				continue
-			}
 			if pos.Line < 1 || pos.Line > len(lines) ||
 				pos.Column < 1 || pos.Column > len(lines[pos.Line-1])+1 {
 				t.Fatalf("invalid byte position %+v in %+v", pos, p)
 			}
 		}
 		start, end := p.Range.Start, p.Range.End
-		emptyAllowed := p.Kind == "statement" && (p.Statements == 0 || lineDirectives)
-		if end.Line < start.Line || (end.Line == start.Line &&
-			(end.Column < start.Column || (end.Column == start.Column && !emptyAllowed))) {
-			t.Fatalf("range is reversed or unexpectedly empty: %+v", p)
+		if end.Line < start.Line || (end.Line == start.Line && end.Column <= start.Column) {
+			t.Fatalf("range is not nonempty and exclusive-ended: %+v", p)
 		}
 		if seen[p] {
 			t.Fatalf("duplicate uncovered point: %+v", p)
@@ -671,6 +651,9 @@ func TestPosition(t *testing.T) {
 	wantBranch(t, points, f.path("position.go"), src, "if é > 0", "if", "false", true)
 	wantBranch(t, points, f.path("position.go"), src, "if é > 0", "if", "true", false)
 	line := sourceLine(t, src, "if é > 0")
+	coveredReturn := sourceLine(t, src, "return true")
+	uncoveredReturn := sourceLine(t, src, "return false")
+	foundUncoveredReturn := false
 	for _, p := range points {
 		if p.Kind == "branch" && p.Construct == "if" && p.Range.Start.Line == line {
 			want := sourceRange{Start: position{Line: line, Column: 5}, End: position{Line: line, Column: 11}}
@@ -681,9 +664,18 @@ func TestPosition(t *testing.T) {
 		if p.File != f.path("position.go") {
 			t.Errorf("point names generated or test source: %+v", p)
 		}
+		if p.Kind == "statement" {
+			if p.Range.Start.Line == coveredReturn {
+				t.Errorf("covered return reported as uncovered: %+v", p)
+			}
+			if p.Range.Start.Line == uncoveredReturn {
+				foundUncoveredReturn = true
+			}
+		}
 	}
-	// Native block ranges can start at a brace rather than the statement.
-	wantBuiltinBlocks(t, f, points)
+	if !foundUncoveredReturn {
+		t.Error("uncovered return statement missing from report")
+	}
 }
 
 func TestFullyCoveredOutputAndDefaultCount(t *testing.T) {

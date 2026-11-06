@@ -10,12 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/jba/cover/internal/blockcover"
 )
 
-// Position is a source line and byte column, normally 1-based. Native coverage
-// on some Go versions reports column 0 for positions adjusted by //line.
+// Position is a 1-based source line and byte column.
 type Position struct {
 	Line   int `json:"line"`
 	Column int `json:"column"`
@@ -27,15 +24,14 @@ type Range struct {
 	End   Position `json:"end"`
 }
 
-// Point identifies a native Go coverage block or a control-flow outcome.
+// Point identifies a statement or a control-flow outcome.
 type Point struct {
-	File       string `json:"file"`
-	Kind       string `json:"kind"`
-	Construct  string `json:"construct,omitempty"`
-	Outcome    string `json:"outcome,omitempty"`
-	Range      Range  `json:"range"`
-	Statements int    `json:"statements,omitempty"`
-	Counter    int    `json:"-"`
+	File      string `json:"file"`
+	Kind      string `json:"kind"`
+	Construct string `json:"construct,omitempty"`
+	Outcome   string `json:"outcome,omitempty"`
+	Range     Range  `json:"range"`
+	Counter   int    `json:"-"`
 }
 
 type insertion struct {
@@ -55,8 +51,8 @@ type instrumenter struct {
 	fn       *function
 }
 
-// Labels have function scope. Branch state resets for a labelled control
-// precede its labels, so a goto must replay those resets before jumping.
+// Labels have function scope. Bookkeeping for a labelled statement normally
+// precedes its labels, so a goto must replay that bookkeeping before jumping.
 // Keep this separate from statement traversal to handle forward references.
 type function struct {
 	labels   map[string]ast.Stmt
@@ -67,7 +63,6 @@ type function struct {
 
 // Instrument inserts references to prefix+Hit(int) and prefix+Bool(int,int,bool).
 // It preserves all original bytes, including build constraints and comments.
-// Native Go block probes are discovered before planning branch instrumentation.
 // Counter IDs are allocated starting at *nextCounter.
 func Instrument(filename string, src []byte, prefix string, nextCounter *int) ([]byte, []Point, error) {
 	if !token.IsIdentifier(prefix) || token.Lookup(prefix).IsKeyword() {
@@ -92,31 +87,9 @@ func Instrument(filename string, src []byte, prefix string, nextCounter *int) ([
 		return nil, nil, unsupported
 	}
 	in := &instrumenter{filename: filename, src: src, fset: fs, file: fs.File(f.Pos()), prefix: prefix, next: nextCounter}
-	// Discover native blocks on the untouched source. Branch bookkeeping must
-	// neither split those blocks nor contribute statements to their weights.
-	edits, blocks, err := blockcover.Instrument(filename, src, prefix, *nextCounter)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, edit := range edits {
-		in.edits = append(in.edits, insertion{offset: edit.Offset, text: edit.Text})
-	}
-	for _, block := range blocks {
-		in.points = append(in.points, Point{
-			File: filename, Kind: "statement", Counter: block.Counter, Statements: block.Statements,
-			Range: Range{
-				Start: Position{Line: block.StartLine, Column: block.StartColumn},
-				End:   Position{Line: block.EndLine, Column: block.EndColumn},
-			},
-		})
-	}
-	*nextCounter += len(blocks)
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.FuncDecl:
-			if n.Name.Name == "_" {
-				return false
-			}
 			if n.Body != nil {
 				in.function(n.Body)
 			}
@@ -141,8 +114,7 @@ func (in *instrumenter) insert(p token.Pos, s string) {
 	in.edits = append(in.edits, insertion{in.file.Offset(p), s})
 }
 func (in *instrumenter) position(p token.Pos) Position {
-	// Branch ranges use physical positions; native block positions come from
-	// the selected Go toolchain's metadata instead.
+	// Ignore //line directives: ranges always address the physical original file.
 	q := in.fset.PositionFor(p, false)
 	return Position{q.Line, q.Column}
 }
@@ -190,8 +162,7 @@ func (in *instrumenter) function(body *ast.BlockStmt) {
 	old := in.fn
 	in.fn = fn
 	// Reserve the insertion before walking the body: declarations must precede
-	// branch resets at the same offset (e.g. func f(){for ...}). Native block
-	// probes may precede declarations, as they do not reference branch state.
+	// other edits at the same offset (e.g. func f(){for ...}).
 	declarations := len(in.edits)
 	in.insert(body.Lbrace+1, "")
 	in.block(body)
@@ -201,9 +172,7 @@ func (in *instrumenter) function(body *ast.BlockStmt) {
 	}
 	for _, g := range fn.gotos {
 		// Insert at the goto keyword, not before its labels: a goto can itself
-		// be a jump target and must still replay its outgoing target's reset.
-		// Native block probes are intentionally not replayed: preserve Go's
-		// own placement and observed behavior for labeled control statements.
+		// be a jump target and must still replay its outgoing target's prelude.
 		in.insert(g.Pos(), fn.preludes[fn.labels[g.Label.Name]])
 	}
 	in.fn = old
@@ -231,6 +200,23 @@ func (in *instrumenter) stmt(s ast.Stmt, anchor token.Pos) {
 		in.block(s.(*ast.BlockStmt))
 		return
 	}
+	end := s.End()
+	switch n := s.(type) {
+	case *ast.IfStmt:
+		end = n.Body.Lbrace
+	case *ast.ForStmt:
+		end = n.Body.Lbrace
+	case *ast.RangeStmt:
+		end = n.Body.Lbrace
+	case *ast.SwitchStmt:
+		end = n.Body.Lbrace
+	case *ast.TypeSwitchStmt:
+		end = n.Body.Lbrace
+	case *ast.SelectStmt:
+		end = n.Body.Lbrace
+	}
+	id := in.point("statement", "", "", s.Pos(), end)
+	in.prelude(s, anchor, in.hit(id))
 	switch n := s.(type) {
 	case *ast.IfStmt:
 		t := in.point("branch", "if", "true", n.Cond.Pos(), n.Cond.End())
@@ -239,9 +225,15 @@ func (in *instrumenter) stmt(s ast.Stmt, anchor token.Pos) {
 		in.insert(n.Cond.End(), "))")
 		in.block(n.Body)
 		if n.Else != nil {
-			// Native coverage supplies the implicit else block needed for its
-			// probes. Branch-only instrumentation needs no extra wrapper.
-			in.stmt(n.Else, n.Else.Pos())
+			if _, ok := n.Else.(*ast.IfStmt); ok {
+				// An inserted statement cannot stand between else and if. Make its
+				// implicit else block explicit, preserving the original lexical scope.
+				in.insert(n.Else.Pos(), "{")
+				in.stmt(n.Else, n.Else.Pos())
+				in.insert(n.Else.End(), "}")
+			} else {
+				in.stmt(n.Else, n.Else.Pos())
+			}
 		}
 	case *ast.ForStmt:
 		in.loop(n, anchor, n.Body, n.Cond != nil)
