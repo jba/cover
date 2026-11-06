@@ -32,7 +32,7 @@ type options struct {
 }
 
 // Run instruments the requested packages, runs their tests, and writes lines of
-// "FILE START-END WORD" to stdout (or the file named by -o). All go command output
+// "FILE START END WORD" to stdout (or the file named by -o). All go command output
 // is sent to stderr. Coverage is reported even if the tests fail.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var opts options
@@ -394,7 +394,7 @@ func encodeReport(packages []packageCoverage, w io.Writer) error {
 		)
 	})
 	for _, point := range uncovered {
-		if _, err := fmt.Fprintf(w, "%s %d:%d-%d:%d %s\n",
+		if _, err := fmt.Fprintf(w, "%s %d:%d %d:%d %s\n",
 			point.File, point.Range.Start.Line, point.Range.Start.Column,
 			point.Range.End.Line, point.Range.End.Column, reportWord(point)); err != nil {
 			return fmt.Errorf("write coverage output: %w", err)

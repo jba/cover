@@ -53,20 +53,20 @@ Only uncovered points are emitted. Test output and diagnostics go to stderr;
 stdout contains only report lines unless `-o` names an output file. Each line is:
 
 ```text
-FILE START-END WORD
+FILE START END WORD
 ```
 
 For example:
 
 ```text
-/repo/foo.go 11:8-11:13 skipped
-/repo/foo.go 12:5-12:11 uncovered
-/repo/foo.go 20:5-20:31 skipped
+/repo/foo.go 11:8 11:13 skipped
+/repo/foo.go 12:5 12:11 uncovered
+/repo/foo.go 20:5 20:31 skipped
 ```
 
 - `FILE` is the absolute original-source filename, without quoting. It may contain
-  spaces; parse the range and word from the right. Filenames containing newlines
-  cannot be represented and cause an error.
+  spaces; parse the start, end, and word from the right. Filenames containing
+  newlines cannot be represented and cause an error.
 - `START` and `END` are `line:column` positions.
 - Ranges are half-open: inclusive start, exclusive end. Lines and byte columns
   are 1-based. `//line` directives do not change these physical coordinates.

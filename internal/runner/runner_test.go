@@ -46,7 +46,7 @@ func TestReport(t *testing.T) {
 	if err := encodeReport(packages, &buf); err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("%s 2:1-2:2 uncovered\n%s 1:1-1:2 uncovered\n%s 3:1-3:2 uncovered\n",
+	want := fmt.Sprintf("%s 2:1 2:2 uncovered\n%s 1:1 1:2 uncovered\n%s 3:1 3:2 uncovered\n",
 		points[3].File, points[2].File, points[0].File)
 	if got := buf.String(); got != want {
 		t.Fatalf("report = %q, want %q", got, want)
@@ -120,7 +120,7 @@ func TestReportOutcomes(t *testing.T) {
 					}
 					want := ""
 					if !covered && tc.word != "" {
-						want = file + " 12:7-14:19 " + tc.word + "\n"
+						want = file + " 12:7 14:19 " + tc.word + "\n"
 					}
 					if buf.String() != want {
 						t.Fatalf("report = %q, want %q", buf.String(), want)
@@ -160,11 +160,11 @@ func TestReportPositionOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := file + " 2:2-2:10 skipped\n" +
-		file + " 2:2-2:10 uncovered\n" +
-		file + " 2:2-2:20 uncovered\n" +
-		file + " 2:2-3:2 uncovered\n" +
-		file + " 2:10-2:12 uncovered\n"
+	want := file + " 2:2 2:10 skipped\n" +
+		file + " 2:2 2:10 uncovered\n" +
+		file + " 2:2 2:20 uncovered\n" +
+		file + " 2:2 3:2 uncovered\n" +
+		file + " 2:10 2:12 uncovered\n"
 	if buf.String() != want {
 		t.Fatalf("position/word order:\ngot  %q\nwant %q", buf.String(), want)
 	}

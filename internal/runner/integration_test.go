@@ -145,7 +145,7 @@ func (f fixture) success(t *testing.T, args ...string) []point {
 	return decodePoints(t, out)
 }
 
-var reportRange = regexp.MustCompile(`^([1-9][0-9]*):([1-9][0-9]*)-([1-9][0-9]*):([1-9][0-9]*)$`)
+var reportRange = regexp.MustCompile(`^([1-9][0-9]*):([1-9][0-9]*) ([1-9][0-9]*):([1-9][0-9]*)$`)
 
 // Split from the right: original, unquoted filenames can contain spaces.
 func parsePointLine(text string) (point, error) {
@@ -164,17 +164,22 @@ func parsePointLine(text string) (point, error) {
 		return p, fmt.Errorf("unexpected report word %q", p.Word)
 	}
 	fileAndRange := text[:wordSpace]
-	rangeSpace := strings.LastIndexByte(fileAndRange, ' ')
-	if rangeSpace < 0 {
-		return p, fmt.Errorf("missing source range")
+	endSpace := strings.LastIndexByte(fileAndRange, ' ')
+	if endSpace < 0 {
+		return p, fmt.Errorf("missing end position")
 	}
-	p.File = fileAndRange[:rangeSpace]
+	fileAndStart := fileAndRange[:endSpace]
+	startSpace := strings.LastIndexByte(fileAndStart, ' ')
+	if startSpace < 0 {
+		return p, fmt.Errorf("missing start position")
+	}
+	p.File = fileAndStart[:startSpace]
 	if !filepath.IsAbs(p.File) {
 		return p, fmt.Errorf("filename is not an unquoted absolute path: %q", p.File)
 	}
-	parts := reportRange.FindStringSubmatch(fileAndRange[rangeSpace+1:])
+	parts := reportRange.FindStringSubmatch(fileAndRange[startSpace+1:])
 	if parts == nil {
-		return p, fmt.Errorf("invalid line:column-line:column range")
+		return p, fmt.Errorf("invalid line:column line:column positions")
 	}
 	values := make([]int, 4)
 	for i, text := range parts[1:] {
@@ -203,7 +208,7 @@ func decodePoints(t *testing.T, output string) []point {
 	for i, text := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
 		p, err := parsePointLine(text)
 		if err != nil {
-			t.Fatalf("stdout line %d is not FILE START-END WORD: %v\n%q", i+1, err, text)
+			t.Fatalf("stdout line %d is not FILE START END WORD: %v\n%q", i+1, err, text)
 		}
 		src, err := os.ReadFile(p.File)
 		if err != nil {
@@ -847,19 +852,19 @@ func TestExercise(t *testing.T) {
 	// extra fields, redundant outcomes, or missing body statements may pass.
 	var want strings.Builder
 	for _, suffix := range []string{
-		"5:5-5:8 skipped",      // Missing if/false.
-		"8:3-8:15 uncovered",   // Else body.
-		"11:3-11:15 uncovered", // Missing true is represented by its body only.
-		"13:2-13:25 skipped",   // Missing for/skipped.
-		"17:3-17:15 uncovered", // Missing entered is represented by its body only.
-		"19:2-19:11 skipped",   // Missing switch/no-match.
-		"23:3-23:15 uncovered", // Missing case body.
-		"27:3-27:15 uncovered", // Actual no-match is covered.
-		"29:2-29:22 skipped",   // Missing type-switch/no-match.
-		"33:3-33:15 uncovered", // Missing type case body.
-		"37:3-37:15 uncovered", // Actual type no-match is covered.
-		"43:3-43:15 uncovered", // Missing default has only a body point, no no-match.
-		"49:3-49:15 uncovered", // Missing select outcome has only a body point.
+		"5:5 5:8 skipped",      // Missing if/false.
+		"8:3 8:15 uncovered",   // Else body.
+		"11:3 11:15 uncovered", // Missing true is represented by its body only.
+		"13:2 13:25 skipped",   // Missing for/skipped.
+		"17:3 17:15 uncovered", // Missing entered is represented by its body only.
+		"19:2 19:11 skipped",   // Missing switch/no-match.
+		"23:3 23:15 uncovered", // Missing case body.
+		"27:3 27:15 uncovered", // Actual no-match is covered.
+		"29:2 29:22 skipped",   // Missing type-switch/no-match.
+		"33:3 33:15 uncovered", // Missing type case body.
+		"37:3 37:15 uncovered", // Actual type no-match is covered.
+		"43:3 43:15 uncovered", // Missing default has only a body point, no no-match.
+		"49:3 49:15 uncovered", // Missing select outcome has only a body point.
 	} {
 		fmt.Fprintf(&want, "%s %s\n", file, suffix)
 	}
@@ -892,7 +897,7 @@ func TestDecisions(t *testing.T) { Decisions(true) }
 func TestParsePointLine(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "space in filename.go")
 	for _, word := range []string{"uncovered", "skipped"} {
-		text := file + " 2:3-4:5 " + word
+		text := file + " 2:3 4:5 " + word
 		p, err := parsePointLine(text)
 		if err != nil || p.File != file || p.Word != word ||
 			p.Range != (sourceRange{Start: position{2, 3}, End: position{4, 5}}) {
@@ -901,23 +906,27 @@ func TestParsePointLine(t *testing.T) {
 	}
 	for _, text := range []string{
 		"", `{"file":"original.go","kind":"statement"}`,
-		`"` + file + `" 1:1-1:2 uncovered`,
-		"relative.go 1:1-1:2 uncovered",
-		file + " 1:1-1:2 statement",
-		file + " 1:1-1:2 true",
-		file + " 1:1-1:2 entered",
-		file + " 1:1-1:2 case",
-		file + " 1:1-1:2 default",
-		file + " 1:1-1:2 no-match",
-		file + " 1:1-1:2 skipped extra",
-		file + " 1:1-1:2 skipped ",
-		file + " 1:1-1:2 skipped\r",
-		file + " 1:1-1:2  skipped",
-		file + " 1:1-1:2\tuncovered",
-		file + " 0:1-1:2 uncovered",
-		file + " 01:1-1:2 uncovered",
-		file + " 1:0-1:2 uncovered",
-		file + " 1:1-2:0 uncovered",
+		`"` + file + `" 1:1 1:2 uncovered`,
+		"relative.go 1:1 1:2 uncovered",
+		file + " 1:1 1:2 statement",
+		file + " 1:1 1:2 true",
+		file + " 1:1 1:2 entered",
+		file + " 1:1 1:2 case",
+		file + " 1:1 1:2 default",
+		file + " 1:1 1:2 no-match",
+		file + " 1:1 1:2 skipped extra",
+		file + " 1:1 1:2 skipped ",
+		file + " 1:1 1:2 skipped\r",
+		file + " 1:1 1:2  skipped",
+		file + " 1:1 1:2\tuncovered",
+		file + " 0:1 1:2 uncovered",
+		file + " 01:1 1:2 uncovered",
+		file + " 1:0 1:2 uncovered",
+		file + " 1:1 2:0 uncovered",
+		file + " 1:1-1:2 uncovered",
+		file + " 1:1  1:2 uncovered",
+		file + " 1:1\t1:2 uncovered",
+		file + " 1:1 uncovered",
 		file + " 1:1:1:2 uncovered",
 		file + " 1:1 - 1:2 uncovered",
 	} {
