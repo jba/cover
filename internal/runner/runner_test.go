@@ -3,7 +3,6 @@ package runner
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,10 +17,11 @@ import (
 
 func TestReport(t *testing.T) {
 	dir := t.TempDir()
-	counterPath := filepath.Join(dir, "counts")
-	data := make([]byte, 4*8)
-	binary.NativeEndian.PutUint64(data[8:], 7)
-	if err := os.WriteFile(counterPath, data, 0600); err != nil {
+	counterDir := filepath.Join(dir, "counts")
+	if err := os.Mkdir(counterDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(counterDir, "123.json"), []byte("[0,7,0,0]"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	point := func(file string, line, counter int) instrument.Point {
@@ -41,7 +41,7 @@ func TestReport(t *testing.T) {
 		point("b.go", 1, 2),
 		point("a.go", 2, 3),
 	}
-	packages := []packageCoverage{{countFile: counterPath, size: len(data), points: points}}
+	packages := []packageCoverage{{countDir: counterDir, count: 4, points: points}}
 	var buf bytes.Buffer
 	if err := encodeReport(packages, &buf); err != nil {
 		t.Fatal(err)
@@ -85,25 +85,69 @@ func TestReport(t *testing.T) {
 		}
 	}
 	packages[0].points = points
-	packages[0].size++
+	packages[0].count++
 	if err := encodeReport(packages, io.Discard); err == nil {
-		t.Error("invalid count file size accepted")
+		t.Error("invalid counter snapshot size accepted")
 	}
 }
 
 func TestReportWriteError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "counts")
-	if err := os.WriteFile(path, make([]byte, 8), 0600); err != nil {
-		t.Fatal(err)
-	}
 	want := errors.New("writer failed")
 	err := encodeReport([]packageCoverage{{
-		countFile: path,
-		size:      8,
-		points:    []instrument.Point{{Counter: 0}},
+		countDir: path,
+		count:    1,
+		points:   []instrument.Point{{Counter: 0}},
 	}}, failingWriter{want})
 	if !errors.Is(err, want) {
 		t.Fatalf("error = %v, want %v", err, want)
+	}
+}
+
+func TestReadCounters(t *testing.T) {
+	dir := t.TempDir()
+	for name, contents := range map[string]string{
+		"123.json":     "[1,2,0]",
+		"456.json":     "[3,0,7]",
+		".snapshot-42": "unfinished snapshot",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := readCounters(dir, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint64{4, 2, 7}; !slices.Equal(got, want) {
+		t.Fatalf("merged counts = %v, want %v", got, want)
+	}
+	for _, path := range []string{t.TempDir(), filepath.Join(dir, "absent")} {
+		got, err := readCounters(path, 3)
+		if err != nil || !slices.Equal(got, []uint64{0, 0, 0}) {
+			t.Errorf("missing snapshots: got %v, %v", got, err)
+		}
+	}
+}
+
+func TestReadCountersInvalid(t *testing.T) {
+	for _, contents := range []string{"not json", "[0]", "[0,0,0]", "null", "[null,0]", "{}", "[-1,0]", "[0.5,0]", "[18446744073709551616,0]", "[0,0] trailing"} {
+		t.Run(contents, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "123.json"), []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readCounters(dir, 2); err == nil {
+				t.Error("invalid snapshot accepted")
+			}
+		})
+	}
+}
+
+func TestPrepareRegistryRequiresModule(t *testing.T) {
+	pkg := listedPackage{Dir: t.TempDir(), ImportPath: "example.com/gopath"}
+	if _, err := prepareRegistry([]listedPackage{pkg}, t.TempDir(), map[string]string{}); err == nil || !strings.Contains(err.Error(), "module mode") {
+		t.Fatalf("GOPATH registry error = %v", err)
 	}
 }
 

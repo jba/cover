@@ -6,7 +6,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 
@@ -64,9 +62,6 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			opts.raceSet = true
 		}
 	})
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		return fmt.Errorf("cover: unsupported platform %s (supported: linux, darwin)", runtime.GOOS)
-	}
 	patterns := flags.Args()
 	if len(patterns) == 0 {
 		patterns = []string{"."}
@@ -74,6 +69,25 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	pkgs, err := listPackages(ctx, patterns, opts, stderr)
 	if err != nil {
 		return err
+	}
+	var selected []listedPackage
+	seen := make(map[string]bool)
+	for _, pkg := range pkgs {
+		if seen[pkg.Dir] {
+			continue
+		}
+		seen[pkg.Dir] = true
+		if pkg.Standard || pkg.Goroot || isVendor(pkg.Dir) {
+			fmt.Fprintf(stderr, "cover: skipping standard or vendor package %s\n", pkg.ImportPath)
+			continue
+		}
+		if pkg.ImportPath == "command-line-arguments" {
+			return errors.New("cover: provide package patterns, not individual Go files")
+		}
+		selected = append(selected, pkg)
+	}
+	if len(selected) == 0 {
+		return errors.New("cover: no instrumentable non-test Go files in requested packages")
 	}
 
 	// Keep all generated files outside the source tree: in particular, this
@@ -88,29 +102,28 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	overlay := struct {
 		Replace map[string]string
 	}{Replace: make(map[string]string)}
+	registryImport, err := prepareRegistry(selected, tempDir, overlay.Replace)
+	if err != nil {
+		return err
+	}
 	var covered []packageCoverage
 	var testPackages []string
-	seen := make(map[string]bool)
-	for _, pkg := range pkgs {
-		if seen[pkg.Dir] {
-			continue
-		}
-		seen[pkg.Dir] = true
-		if pkg.Standard || pkg.Goroot || isVendor(pkg.Dir) {
-			fmt.Fprintf(stderr, "cover: skipping standard or vendor package %s\n", pkg.ImportPath)
-			continue
-		}
-		if pkg.ImportPath == "command-line-arguments" {
-			return errors.New("cover: provide package patterns, not individual Go files")
-		}
+	for number, pkg := range selected {
 		// A test-only package may exercise production code in another selected
-		// package. Keep it in the test invocation even though it needs no overlay.
+		// package. It also needs a TestMain overlay to save that dependency.
 		testPackages = append(testPackages, pkg.ImportPath)
 		if len(pkg.GoFiles)+len(pkg.CgoFiles) == 0 {
 			fmt.Fprintf(stderr, "cover: not instrumenting %s: no non-test Go files (tests will still run)\n", pkg.ImportPath)
+			prefix, err := packagePrefix(pkg)
+			if err != nil {
+				return err
+			}
+			if err := prepareTestMain(pkg, prefix, registryImport, tempDir, number, overlay.Replace); err != nil {
+				return err
+			}
 			continue
 		}
-		coverage, err := preparePackage(pkg, tempDir, len(covered), overlay.Replace)
+		coverage, err := preparePackage(pkg, tempDir, registryImport, number, overlay.Replace)
 		if err != nil {
 			return err
 		}
@@ -128,7 +141,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("write overlay: %w", err)
 	}
 
-	testArgs := []string{"test", "-overlay=" + overlayPath, fmt.Sprintf("-count=%d", opts.count)}
+	// The compiler understands a new directory supplied entirely by an
+	// overlay, but vet tries to chdir to it on disk. Do not materialize the
+	// registry in the user's module just to satisfy vet.
+	testArgs := []string{"test", "-vet=off", "-overlay=" + overlayPath, fmt.Sprintf("-count=%d", opts.count)}
 	if opts.run != "" {
 		testArgs = append(testArgs, "-run="+opts.run)
 	}
@@ -150,8 +166,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		testErr = fmt.Errorf("go test: %w", testErr)
 	}
 
-	// Do not return on a test failure before reading the shared files. A failed
-	// test (including one calling os.Exit) can still produce useful coverage.
+	// Do not return on a test failure before reading snapshots from binaries
+	// that completed TestMain. Abnormal exits may leave no snapshot.
 	reportErr := writeReport(covered, opts.output, stdout)
 	return errors.Join(testErr, reportErr)
 }
@@ -166,6 +182,13 @@ type listedPackage struct {
 	XTestGoFiles []string
 	Standard     bool
 	Goroot       bool
+	Module       *listedModule
+}
+
+type listedModule struct {
+	Path string
+	Dir  string
+	Main bool
 }
 
 func listPackages(ctx context.Context, patterns []string, opts options, stderr io.Writer) ([]listedPackage, error) {
@@ -213,12 +236,12 @@ func isVendor(dir string) bool {
 }
 
 type packageCoverage struct {
-	countFile string
-	size      int
-	points    []instrument.Point
+	countDir string
+	count    int
+	points   []instrument.Point
 }
 
-func preparePackage(pkg listedPackage, tempDir string, number int, overlay map[string]string) (packageCoverage, error) {
+func preparePackage(pkg listedPackage, tempDir, registryImport string, number int, overlay map[string]string) (packageCoverage, error) {
 	var result packageCoverage
 	pkgDir, err := filepath.Abs(pkg.Dir)
 	if err != nil {
@@ -228,8 +251,8 @@ func preparePackage(pkg listedPackage, tempDir string, number int, overlay map[s
 	slices.Sort(files)
 	originals := make(map[string][]byte)
 	var sourceForPrefix []byte
-	// Test files aren't rewritten, but their identifiers must not collide with
-	// declarations in the generated file either.
+	// Test identifiers must not collide with generated runtime declarations or
+	// with imports and locals added when preparing TestMain.
 	allFiles := append(slices.Clone(files), pkg.TestGoFiles...)
 	allFiles = append(allFiles, pkg.XTestGoFiles...)
 	for _, name := range allFiles {
@@ -273,21 +296,15 @@ func preparePackage(pkg listedPackage, tempDir string, number int, overlay map[s
 		}
 		overlay[path] = backing
 	}
-	if nextCounter < 0 || nextCounter > int(^uint(0)>>1)/8 {
+	if nextCounter < 0 {
 		return result, errors.New("cover: too many counters")
 	}
-	result.size = max(nextCounter, 1) * 8
-	result.countFile = filepath.Join(tempDir, fmt.Sprintf("pkg%d_counts", number))
-	f, err := os.OpenFile(result.countFile, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return result, fmt.Errorf("create counter file: %w", err)
+	result.count = nextCounter
+	result.countDir = filepath.Join(tempDir, fmt.Sprintf("pkg%d_counts", number))
+	if err := os.Mkdir(result.countDir, 0700); err != nil {
+		return result, fmt.Errorf("create counter directory: %w", err)
 	}
-	truncateErr := f.Truncate(int64(result.size))
-	closeErr := f.Close()
-	if err := errors.Join(truncateErr, closeErr); err != nil {
-		return result, fmt.Errorf("initialize counter file: %w", err)
-	}
-	runtimeSrc, err := runtimeSource(pkg.Name, prefix, result.countFile, result.size)
+	runtimeSrc, err := runtimeSource(pkg.Name, prefix, result.countDir, registryImport, result.count)
 	if err != nil {
 		return result, err
 	}
@@ -296,7 +313,27 @@ func preparePackage(pkg listedPackage, tempDir string, number int, overlay map[s
 		return result, fmt.Errorf("write coverage runtime: %w", err)
 	}
 	overlay[virtualPath] = runtimePath
+	if err := prepareTestMain(pkg, prefix, registryImport, tempDir, number, overlay); err != nil {
+		return result, err
+	}
 	return result, nil
+}
+
+func packagePrefix(pkg listedPackage) (string, error) {
+	files := append(slices.Clone(pkg.GoFiles), pkg.CgoFiles...)
+	files = append(files, pkg.TestGoFiles...)
+	files = append(files, pkg.XTestGoFiles...)
+	var source []byte
+	for _, name := range files {
+		path := filepath.Join(pkg.Dir, name)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", path, err)
+		}
+		source = append(source, src...)
+		source = append(source, '\n')
+	}
+	return uniquePrefix(source)
 }
 
 func uniquePrefix(source []byte) (string, error) {
@@ -328,18 +365,15 @@ func writeReport(packages []packageCoverage, outputPath string, stdout io.Writer
 func encodeReport(packages []packageCoverage, w io.Writer) error {
 	var uncovered []instrument.Point
 	for _, pkg := range packages {
-		counts, err := os.ReadFile(pkg.countFile)
+		counts, err := readCounters(pkg.countDir, pkg.count)
 		if err != nil {
-			return fmt.Errorf("read counters: %w", err)
-		}
-		if len(counts) != pkg.size {
-			return fmt.Errorf("counter file %s has size %d, want %d", pkg.countFile, len(counts), pkg.size)
+			return err
 		}
 		for _, point := range pkg.points {
-			if point.Counter < 0 || point.Counter >= len(counts)/8 {
+			if point.Counter < 0 || point.Counter >= len(counts) {
 				return fmt.Errorf("invalid counter %d for %s", point.Counter, point.File)
 			}
-			if binary.NativeEndian.Uint64(counts[point.Counter*8:]) == 0 {
+			if counts[point.Counter] == 0 {
 				uncovered = append(uncovered, point)
 			}
 		}
@@ -365,4 +399,47 @@ func encodeReport(packages []packageCoverage, w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// readCounters merges complete per-process snapshots. An absent directory (or
+// an empty one) means the package never completed a save, so its counters are
+// all zero. Temporary files left by an interrupted save are not snapshots.
+func readCounters(dir string, count int) ([]uint64, error) {
+	if count < 0 {
+		return nil, fmt.Errorf("invalid counter count %d", count)
+	}
+	counts := make([]uint64, count)
+	files, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return counts, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read counter directory %s: %w", dir, err)
+	}
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, file.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read counter snapshot %s: %w", path, err)
+		}
+		var snapshot []uint64
+		if err := json.Unmarshal(data, &snapshot); err != nil {
+			return nil, fmt.Errorf("decode counter snapshot %s: %w", path, err)
+		}
+		// encoding/json accepts null as a uint64 and silently produces zero.
+		// A snapshot contains only numbers, so null anywhere is corrupt data.
+		if bytes.Contains(data, []byte("null")) {
+			return nil, fmt.Errorf("counter snapshot %s contains null counters", path)
+		}
+		if len(snapshot) != count {
+			return nil, fmt.Errorf("counter snapshot %s has %d counters, want %d", path, len(snapshot), count)
+		}
+		for i, value := range snapshot {
+			counts[i] += value
+		}
+	}
+	return counts, nil
 }
