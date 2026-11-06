@@ -3,8 +3,8 @@ package runner
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -46,35 +46,21 @@ func TestReport(t *testing.T) {
 	if err := encodeReport(packages, &buf); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(strings.ToLower(buf.String()), "counter") {
-		t.Fatalf("counter leaked into JSON: %s", &buf)
+	want := fmt.Sprintf("%s 2:1-2:2 uncovered\n%s 1:1-1:2 uncovered\n%s 3:1-3:2 uncovered\n",
+		points[3].File, points[2].File, points[0].File)
+	if got := buf.String(); got != want {
+		t.Fatalf("report = %q, want %q", got, want)
 	}
-	var got []instrument.Point
-	dec := json.NewDecoder(&buf)
-	for {
-		var p instrument.Point
-		err := dec.Decode(&p)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		got = append(got, p)
-	}
-	want := []instrument.Point{points[3], points[2], points[0]}
-	for i := range want {
-		want[i].Counter = 0 // Counter is intentionally not serialized.
-	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("report = %+v, want %+v", got, want)
-	}
-	outPath := filepath.Join(dir, "output.jsonl")
+	outPath := filepath.Join(dir, "output.txt")
 	if err := writeReport(packages, outPath, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if contents, err := os.ReadFile(outPath); err != nil || len(contents) == 0 {
+	if contents, err := os.ReadFile(outPath); err != nil || string(contents) != want {
 		t.Fatalf("output file: contents %q, err %v", contents, err)
+	}
+	buf.Reset()
+	if err := writeReport(packages, "-", &buf); err != nil || buf.String() != want {
+		t.Fatalf("stdout destination: output %q, err %v", buf.String(), err)
 	}
 	for _, counter := range []int{-1, 4} {
 		bad := slices.Clone(points)
@@ -91,13 +77,124 @@ func TestReport(t *testing.T) {
 	}
 }
 
+func TestReportOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		kind, construct, outcome, word string
+	}{
+		{"statement", "", "", "uncovered"},
+		{"branch", "if", "false", "skipped"},
+		{"branch", "for", "skipped", "skipped"},
+		{"branch", "switch", "no-match", "skipped"},
+		{"branch", "type-switch", "no-match", "skipped"},
+		{"branch", "if", "true", ""},
+		{"branch", "for", "entered", ""},
+		{"branch", "switch", "case", ""},
+		{"branch", "switch", "default", ""},
+		{"branch", "type-switch", "case", ""},
+		{"branch", "type-switch", "default", ""},
+		{"branch", "select", "case", ""},
+		{"branch", "select", "default", ""},
+	} {
+		t.Run(tc.kind+"/"+tc.construct+"/"+tc.outcome, func(t *testing.T) {
+			for _, covered := range []bool{false, true} {
+				t.Run(fmt.Sprintf("covered=%t", covered), func(t *testing.T) {
+					dir := t.TempDir()
+					count := "0"
+					if covered {
+						count = "1"
+					}
+					if err := os.WriteFile(filepath.Join(dir, "123.json"), []byte("["+count+"]"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					// Filenames are preserved verbatim, even with internal spaces.
+					file := filepath.Join(dir, "directory with spaces", "file  with spaces.go")
+					p := instrument.Point{
+						File: file, Kind: tc.kind, Construct: tc.construct, Outcome: tc.outcome,
+						Range: instrument.Range{Start: instrument.Position{Line: 12, Column: 7},
+							End: instrument.Position{Line: 14, Column: 19}},
+					}
+					var buf bytes.Buffer
+					err := encodeReport([]packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}, &buf)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := ""
+					if !covered && tc.word != "" {
+						want = file + " 12:7-14:19 " + tc.word + "\n"
+					}
+					if buf.String() != want {
+						t.Fatalf("report = %q, want %q", buf.String(), want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestReportPositionOrder(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "example.go")
+	point := func(startColumn, endLine, endColumn int, branch bool) instrument.Point {
+		p := instrument.Point{
+			File: file, Kind: "statement",
+			Range: instrument.Range{
+				Start: instrument.Position{Line: 2, Column: startColumn},
+				End:   instrument.Position{Line: endLine, Column: endColumn},
+			},
+		}
+		if branch {
+			p.Kind, p.Construct, p.Outcome = "branch", "for", "skipped"
+		}
+		return p
+	}
+	var buf bytes.Buffer
+	err := encodeReport([]packageCoverage{{
+		countDir: t.TempDir(), count: 1,
+		points: []instrument.Point{
+			point(10, 2, 12, false),
+			point(2, 3, 2, false),
+			point(2, 2, 20, false),
+			point(2, 2, 10, false),
+			point(2, 2, 10, true),
+		},
+	}}, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := file + " 2:2-2:10 skipped\n" +
+		file + " 2:2-2:10 uncovered\n" +
+		file + " 2:2-2:20 uncovered\n" +
+		file + " 2:2-3:2 uncovered\n" +
+		file + " 2:10-2:12 uncovered\n"
+	if buf.String() != want {
+		t.Fatalf("position/word order:\ngot  %q\nwant %q", buf.String(), want)
+	}
+}
+
+func TestReportRejectsNewlineFilename(t *testing.T) {
+	for _, newline := range []string{"\n", "\r"} {
+		p := instrument.Point{File: "valid.go", Kind: "statement"}
+		bad := p
+		bad.File = "invalid" + newline + ".go"
+		var buf bytes.Buffer
+		err := encodeReport([]packageCoverage{{
+			countDir: t.TempDir(), count: 1, points: []instrument.Point{p, bad},
+		}}, &buf)
+		if err == nil || !strings.Contains(err.Error(), "filename contains a newline") {
+			t.Fatalf("newline filename error = %v", err)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("partial output for unrepresentable filename: %q", buf.String())
+		}
+	}
+}
+
 func TestReportWriteError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "counts")
 	want := errors.New("writer failed")
 	err := encodeReport([]packageCoverage{{
 		countDir: path,
 		count:    1,
-		points:   []instrument.Point{{Counter: 0}},
+		points:   []instrument.Point{{Kind: "statement", Counter: 0}},
 	}}, failingWriter{want})
 	if !errors.Is(err, want) {
 		t.Fatalf("error = %v, want %v", err, want)

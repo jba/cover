@@ -31,14 +31,14 @@ type options struct {
 	raceSet bool
 }
 
-// Run instruments the requested packages, runs their tests, and writes one JSON
-// object per uncovered point to stdout (or the file named by -o). All go command
-// output is sent to stderr. Coverage is reported even if the tests fail.
+// Run instruments the requested packages, runs their tests, and writes lines of
+// "FILE START-END WORD" to stdout (or the file named by -o). All go command output
+// is sent to stderr. Coverage is reported even if the tests fail.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var opts options
 	flags := flag.NewFlagSet("cover", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	flags.StringVar(&opts.output, "o", "", "write uncovered points as JSONL to file (default stdout)")
+	flags.StringVar(&opts.output, "o", "", "write coverage report to file (default stdout)")
 	flags.StringVar(&opts.run, "run", "", "run only tests matching the regular expression")
 	flags.IntVar(&opts.count, "count", 1, "run each test this many times (disables the test cache)")
 	flags.StringVar(&opts.timeout, "timeout", "", "test timeout, as a Go duration (default go test timeout)")
@@ -373,7 +373,10 @@ func encodeReport(packages []packageCoverage, w io.Writer) error {
 			if point.Counter < 0 || point.Counter >= len(counts) {
 				return fmt.Errorf("invalid counter %d for %s", point.Counter, point.File)
 			}
-			if counts[point.Counter] == 0 {
+			if counts[point.Counter] == 0 && reportWord(point) != "" {
+				if strings.ContainsAny(point.File, "\r\n") {
+					return fmt.Errorf("coverage filename contains a newline: %q", point.File)
+				}
 				uncovered = append(uncovered, point)
 			}
 		}
@@ -387,18 +390,34 @@ func encodeReport(packages []packageCoverage, w io.Writer) error {
 			cmp.Compare(a.Range.Start.Column, b.Range.Start.Column),
 			cmp.Compare(a.Range.End.Line, b.Range.End.Line),
 			cmp.Compare(a.Range.End.Column, b.Range.End.Column),
-			strings.Compare(a.Kind, b.Kind),
-			strings.Compare(a.Construct, b.Construct),
-			strings.Compare(a.Outcome, b.Outcome),
+			strings.Compare(reportWord(a), reportWord(b)),
 		)
 	})
-	enc := json.NewEncoder(w)
 	for _, point := range uncovered {
-		if err := enc.Encode(point); err != nil {
+		if _, err := fmt.Fprintf(w, "%s %d:%d-%d:%d %s\n",
+			point.File, point.Range.Start.Line, point.Range.Start.Column,
+			point.Range.End.Line, point.Range.End.Column, reportWord(point)); err != nil {
 			return fmt.Errorf("write coverage output: %w", err)
 		}
 	}
 	return nil
+}
+
+// Other branch outcomes are represented by statement coverage of their bodies,
+// not by separate records. Effectively empty bodies have no statement records.
+func reportWord(point instrument.Point) string {
+	if point.Kind == "statement" {
+		return "uncovered"
+	}
+	if point.Kind == "branch" {
+		switch {
+		case point.Construct == "if" && point.Outcome == "false",
+			point.Construct == "for" && point.Outcome == "skipped",
+			(point.Construct == "switch" || point.Construct == "type-switch") && point.Outcome == "no-match":
+			return "skipped"
+		}
+	}
+	return ""
 }
 
 // readCounters merges complete per-process snapshots. An absent directory (or

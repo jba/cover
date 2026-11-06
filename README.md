@@ -1,7 +1,7 @@
 # cover
 
 `cover` runs Go tests and reports **uncovered statements and branch outcomes** as
-JSONL.
+line-oriented text.
 
 Go's built-in coverage measures statements, not branch outcomes. For example:
 
@@ -16,15 +16,15 @@ func abs(n int) int {
 
 A test that calls only `abs(-1)` gives this function 100% built-in statement
 coverage: the `if` body and the `return` both execute. But the condition is never
-false, so the path that skips the body is untested. `cover` reports that missing
-`false` outcome at `n < 0`.
+false, so the path that skips the body is untested. `cover` reports `skipped` at
+`n < 0` to identify that missing outcome.
 
 Requires Go 1.26 or later and module mode. The runtime is pure Go; Linux is tested.
 
 ```sh
 go install github.com/jba/cover@latest
-cover ./... > uncovered.jsonl
-cover -run TestParse -race -o uncovered.jsonl ./parser
+cover ./... > uncovered.txt
+cover -run TestParse -race -o uncovered.txt ./parser
 ```
 
 From a checkout, use `go run . [flags] [packages]`. Package patterns default to
@@ -33,7 +33,7 @@ From a checkout, use `go run . [flags] [packages]`. Package patterns default to
 ## Flags
 
 ```
--o file       JSONL destination (default stdout; '-' also means stdout)
+-o file       Report destination (default stdout; '-' also means stdout)
 -run regexp   Select tests using go test's -run
 -count n      Test repetitions (default 1, bypassing cached test results)
 -timeout d    Forward a test timeout, e.g. 30s
@@ -50,54 +50,69 @@ tests still run and can exercise the selected production packages.
 ## Output
 
 Only uncovered points are emitted. Test output and diagnostics go to stderr;
-stdout is exclusively JSONL unless `-o` names an output file.
+stdout contains only report lines unless `-o` names an output file. Each line is:
 
-```jsonl
-{"file":"/repo/foo.go","kind":"statement","range":{"start":{"line":12,"column":5},"end":{"line":12,"column":11}}}
-{"file":"/repo/foo.go","kind":"branch","construct":"if","outcome":"false","range":{"start":{"line":11,"column":8},"end":{"line":11,"column":13}}}
-{"file":"/repo/foo.go","kind":"branch","construct":"for","outcome":"skipped","range":{"start":{"line":20,"column":5},"end":{"line":20,"column":31}}}
+```text
+FILE START-END WORD
 ```
 
-- `file` is the absolute original-source filename.
+For example:
+
+```text
+/repo/foo.go 11:8-11:13 skipped
+/repo/foo.go 12:5-12:11 uncovered
+/repo/foo.go 20:5-20:31 skipped
+```
+
+- `FILE` is the absolute original-source filename, without quoting. It may contain
+  spaces; parse the range and word from the right. Filenames containing newlines
+  cannot be represented and cause an error.
+- `START` and `END` are `line:column` positions.
 - Ranges are half-open: inclusive start, exclusive end. Lines and byte columns
   are 1-based. `//line` directives do not change these physical coordinates.
-- Statement ranges identify original statements; control-statement ranges cover
-  their headers, not their bodies. This is statement-oriented coverage, **not an
-  exact reproduction of `go test -cover`'s basic-block regions or percentages**.
-- A branch range identifies the decision/header, not an invented empty body.
-  Both missing outcomes can therefore have the same range. Uncovered statement
-  records inside an unentered branch are also emitted; this overlap is intended.
-- Results are sorted by filename, source position, and point description.
+- `uncovered` identifies a statement that never executed. Control-statement ranges
+  cover their headers, not their bodies. This is statement-oriented coverage,
+  **not an exact reproduction of `go test -cover`'s basic-block regions or percentages**.
+- `skipped` identifies a decision whose skipping outcome was **never observed**:
+  an `if` condition was never false, a loop never finished with zero iterations,
+  or a switch without a default never finished without matching a case. Its
+  range identifies the condition or header, not an invented empty body.
+- Uncovered body statements are reported independently; overlapping ranges are
+  intentional. Results are sorted by filename, source position, and word.
 
-An empty report means all instrumented obligations were observed, **provided
-that the command succeeded**. Missing coverage does not make the command fail;
-listing, instrumentation, build, and test errors do. Snapshots that were saved
+An empty report means there are no gaps under these reporting rules, **provided
+that the command succeeded**. It does not establish every possible branch
+outcome: empty bodies, for example, have no statements to report. Missing
+coverage does not make the command fail; listing, instrumentation, build, and
+test errors do. Snapshots that were saved
 are still reported after a test failure, timeout, or abnormal exit; such a report
 is partial and must not be treated as a successful coverage run. A process that
 does not reach its save path can lose all its coverage.
 
-## Branch obligations
+## Skipped outcomes
 
-| Construct | Outcomes | Report range |
+| Construct | Outcome that must be observed | Report range |
 | --- | --- | --- |
-| `if` | `true`, `false` | Complete condition |
-| Conditional `for`, any `range` | `entered`, `skipped` | Loop header |
-| Unconditional `for` | `entered` | Loop header |
-| Expression/type switch | One `case` per clause, explicit `default`, or implicit `no-match` | Clause header; switch header for `no-match` |
-| `select` | One `case` per communication clause, explicit `default` | Clause header |
+| `if` | Condition evaluates to false | Complete condition |
+| Conditional `for`, any `range` | Loop finishes with zero body executions | Loop header |
+| Expression/type switch without a default | Switch finishes without matching a case | Switch header |
 
-For both ordinary and range loops, `construct` is `"for"`. `entered` means at
-least one body execution during a particular encounter with the loop. `skipped`
-means that encounter finished normally without executing the body. A false
-condition **after** one or more iterations does not satisfy `skipped`.
+There are no separate records for true conditions, loop entry, switch case or
+default entry, or select clause entry. Statement coverage reports unexecuted
+code in those bodies instead. An untaken empty true branch is not reported.
+
+For both ordinary and range loops, skipping means a particular encounter with
+the loop finished normally without executing the body. A false condition
+**after** one or more iterations does not satisfy `skipped`.
 
 Each loop gets a local Boolean declared at function entry. First body entry sets
-it and records `entered`; normal completion records `skipped` only if it is still
-false. This handles `goto`, `break`, `continue`, early `return`, empty bodies, and
+it; normal completion records `skipped` only if it is still false. This handles
+`goto`, `break`, `continue`, early `return`, empty bodies, and
 labeled loops.
 Panicking during initialization, condition evaluation, or range evaluation does
-not falsely record a skipped loop. A loop never reached has neither outcome
-covered. An unconditional `for` has no `skipped` obligation.
+not falsely record a skipped loop. A loop never reached can have both `uncovered`
+and `skipped` records at its header. An unconditional `for` has no `skipped`
+obligation.
 
 State resets and statement-entry counters normally precede the statement's
 labels. A `goto` to such a label replays that entry bookkeeping immediately
@@ -106,11 +121,11 @@ labeled `break` and `continue`. No new blocks surround loops or switches, and
 hoisted declarations cannot be skipped by a jump. Labels and jumps are resolved
 separately within each function, including function literals.
 
-Switch clauses measure **entry**, including entry by `fallthrough`, not whether
-every expression in a multi-expression case matched. Selects do not invent an
-implicit default branch. Whole-condition branch coverage preserves short-circuit
-evaluation, but does **not** establish separate coverage of `a` and `b` in
-`a || b`; condition/MC/DC coverage is not implemented.
+Statement coverage inside switch clauses measures **entry**, including entry by
+`fallthrough`, not whether every expression in a multi-expression case matched.
+Selects do not invent an implicit default branch. Whole-condition branch coverage
+preserves short-circuit evaluation, but does **not** establish separate coverage
+of `a` and `b` in `a || b`; condition/MC/DC coverage is not implemented.
 
 ## Implementation and limitations
 
@@ -161,8 +176,9 @@ Current limitations:
   late counter updates cannot be reliably included.
 - Statement instrumentation does not cover package-level initializer expressions
   directly (but does cover functions they call). Assembly is not instrumented.
-- There is no feasibility analysis: logically impossible Boolean outcomes and
-  zero-iteration cases still appear as obligations, except unconditional `for`.
+- There is no feasibility analysis: logically impossible false outcomes,
+  zero-iteration cases, and switch no-match outcomes still appear as obligations,
+  except where structurally excluded (an unconditional `for` or an explicit default).
 
 ## Development
 
