@@ -47,6 +47,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: cover [flags] [packages]")
 		flags.PrintDefaults()
+		fmt.Fprintln(stderr, `
+Output: FILE START END WORD
+  FILE is the original absolute source path.
+  START and END are 1-based line:byte-column positions; END is exclusive.
+  WORD is "uncovered" for a statement that never executed, or "skipped" for
+  an unobserved if-false, zero-iteration loop, or switch no-match outcome.`)
 	}
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

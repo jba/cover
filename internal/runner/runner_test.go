@@ -256,11 +256,24 @@ func TestRunFlags(t *testing.T) {
 	// These paths should not need to invoke the Go tool at all.
 	t.Setenv("PATH", "")
 	var out, diagnostic bytes.Buffer
-	if err := Run(context.Background(), []string{"-help"}, &out, &diagnostic); err != nil {
-		t.Fatal(err)
-	}
-	if out.Len() != 0 || !strings.Contains(diagnostic.String(), "Usage: cover") {
-		t.Fatalf("help: stdout=%q stderr=%q", &out, &diagnostic)
+	for _, help := range []string{"-h", "-help"} {
+		out.Reset()
+		diagnostic.Reset()
+		if err := Run(context.Background(), []string{help}, &out, &diagnostic); err != nil {
+			t.Fatal(err)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("%s wrote help to stdout: %q", help, &out)
+		}
+		for _, text := range []string{
+			"Usage: cover", "Output: FILE START END WORD",
+			"original absolute source path", "1-based line:byte-column", "END is exclusive",
+			`"uncovered"`, `"skipped"`, "if-false", "zero-iteration loop", "switch no-match",
+		} {
+			if !strings.Contains(diagnostic.String(), text) {
+				t.Errorf("%s output lacks %q:\n%s", help, text, &diagnostic)
+			}
+		}
 	}
 	for _, args := range [][]string{{"-count=-1"}, {"-nonexistent-flag"}} {
 		if err := Run(context.Background(), args, &out, &diagnostic); err == nil {
