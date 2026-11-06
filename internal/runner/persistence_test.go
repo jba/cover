@@ -36,8 +36,8 @@ func TestValue(t *testing.T) { During(true) }
 	}, ".")
 	points := f.success(t)
 	for _, marker := range []string{"// before", "// during", "// after", "// deferred"} {
-		wantBranch(t, points, f.path("value.go"), src, marker, "if", "true", false)
 		wantBranch(t, points, f.path("value.go"), src, marker, "if", "false", true)
+		wantStatement(t, points, f.path("value.go"), src, marker, "return", false)
 	}
 }
 
@@ -56,8 +56,8 @@ func initialize(yes bool) int {
 	// No original _test.go exists: the generated TestMain must make go test
 	// execute the package's global initializer and then save its counters.
 	points := f.success(t)
-	wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "true", false)
 	wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "false", true)
+	wantStatement(t, points, f.path("value.go"), src, "if yes", "return 1", false)
 }
 
 func TestProductionMainPackage(t *testing.T) {
@@ -77,8 +77,8 @@ func TestMainFunction(t *testing.T) { main() }
 `,
 	}, ".")
 	points := f.success(t)
-	wantBranch(t, points, f.path("main.go"), src, "if yes", "if", "true", false)
 	wantBranch(t, points, f.path("main.go"), src, "if yes", "if", "false", true)
+	wantStatement(t, points, f.path("main.go"), src, "if yes", "return 1", false)
 	for _, p := range points {
 		if p.Kind == "statement" && p.Range.Start.Line == sourceLine(t, src, "func main()") {
 			t.Errorf("covered production main reported as uncovered: %+v", p)

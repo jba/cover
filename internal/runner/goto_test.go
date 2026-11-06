@@ -6,7 +6,7 @@ import (
 )
 
 // Goto tests must not run in parallel: the fixture helpers change the working
-// directory. success checks JSONL and snapshots every original fixture file.
+// directory. success checks the text report and snapshots every original fixture file.
 
 func wantGotoStatement(t *testing.T, points []point, file, src, marker string, want bool) {
 	t.Helper()
@@ -101,21 +101,19 @@ func TestLoops(t *testing.T) {
 			points := f.success(t, "-timeout", "15s")
 			file := f.path("goto.go")
 			for _, check := range []struct {
-				marker           string
-				entered, skipped bool
+				marker  string
+				skipped bool
 			}{
-				{"// forward-loop", false, true},
-				{"// zero-loop", true, false},
-				{"// entered-then-zero", false, false},
-				{"// zero-then-entered", false, false},
+				{"// forward-loop", true},
+				{"// zero-loop", false},
+				{"// entered-then-zero", false},
+				{"// zero-then-entered", false},
 			} {
-				wantBranch(t, points, file, src, check.marker, "for", "entered", check.entered)
 				wantBranch(t, points, file, src, check.marker, "for", "skipped", check.skipped)
 				wantGotoStatement(t, points, file, src, check.marker, false)
 			}
 			// Resetting on reentry matters especially when an earlier entry set
 			// the flag true and the subsequent entry has no body iterations.
-			wantBranch(t, points, file, src, "// infinite-target", "for", "entered", false)
 			wantBranch(t, points, file, src, "// infinite-target", "for", "skipped", false)
 			wantGotoStatement(t, points, file, src, "// infinite-target", false)
 			wantGotoStatement(t, points, file, src, "// skipped-prelude", true)
@@ -200,11 +198,11 @@ func JumpOverConstructs() int {
 	}
 	switch 1 { // jumped-switch
 	case 1: // jumped-case
-		total += 1000
+		total += 1000 // jumped-case-body
 	}
 	switch any(1).(type) { // jumped-type-switch
 	case int: // jumped-type-case
-		total += 10000
+		total += 10000 // jumped-type-case-body
 	}
 After:
 	return total // jumped-return
@@ -225,7 +223,6 @@ func TestLabels(t *testing.T) {
 	}, ".")
 	points := f.success(t, "-timeout", "15s")
 	file := f.path("goto.go")
-	wantBranch(t, points, file, src, "// adjacent-loop", "for", "entered", false)
 	wantBranch(t, points, file, src, "// adjacent-loop", "for", "skipped", false)
 	wantGotoStatement(t, points, file, src, "// adjacent-loop", false)
 	// Wrapping a labelled loop in a block would make these break/continue
@@ -234,21 +231,19 @@ func TestLabels(t *testing.T) {
 		"// control-outer", "// control-inner", "// range-control-outer",
 		"// range-control-inner", "// leave-loop\n",
 	} {
-		wantBranch(t, points, file, src, marker, "for", "entered", false)
 		wantBranch(t, points, file, src, marker, "for", "skipped", true)
 		wantGotoStatement(t, points, file, src, marker, false)
 	}
 	for _, marker := range []string{"// jumped-for", "// jumped-range"} {
-		wantBranch(t, points, file, src, marker, "for", "entered", true)
 		wantBranch(t, points, file, src, marker, "for", "skipped", true)
 		wantGotoStatement(t, points, file, src, marker, true)
 	}
 	wantBranch(t, points, file, src, "// jumped-switch", "switch", "no-match", true)
-	wantBranch(t, points, file, src, "// jumped-case", "switch", "case", true)
 	wantBranch(t, points, file, src, "// jumped-type-switch", "type-switch", "no-match", true)
-	wantBranch(t, points, file, src, "// jumped-type-case", "type-switch", "case", true)
 	wantGotoStatement(t, points, file, src, "// jumped-switch", true)
 	wantGotoStatement(t, points, file, src, "// jumped-type-switch", true)
+	wantGotoStatement(t, points, file, src, "// jumped-case-body", true)
+	wantGotoStatement(t, points, file, src, "// jumped-type-case-body", true)
 	wantGotoStatement(t, points, file, src, "// jumped-return", false)
 	wantGotoStatement(t, points, file, src, "// leave-loop-return", false)
 }
@@ -262,10 +257,10 @@ func SwitchReentry() int {
 Dispatch:
 	switch value { // switch-reentry
 	case 1: // switch-matched
-		total += 10
+		total += 10 // switch-matched-body
 		break Dispatch
 	case 2: // switch-unmatched
-		total += 100
+		total += 100 // switch-unmatched-body
 	}
 	passes++
 	if passes == 1 {
@@ -281,10 +276,10 @@ func TypeSwitchReentry() int {
 Dispatch:
 	switch v := value.(type) { // type-reentry
 	case int: // type-matched
-		total += v
+		total += v // type-matched-body
 		break Dispatch
 	case string: // type-unmatched
-		total += len(v)
+		total += len(v) // type-unmatched-body
 	}
 	passes++
 	if passes == 1 {
@@ -299,7 +294,7 @@ func NoMatchOnly() int {
 Dispatch:
 	switch 9 { // switch-no-match
 	case 1: // switch-never-matched
-		total++
+		total++ // switch-never-matched-body
 	}
 	return total
 }
@@ -309,7 +304,7 @@ func TypeNoMatchOnly() int {
 Dispatch:
 	switch any(false).(type) { // type-no-match
 	case int: // type-never-matched
-		total++
+		total++ // type-never-matched-body
 	}
 	return total
 }
@@ -318,9 +313,9 @@ func LeaveSwitch() int {
 Dispatch:
 	switch 1 { // leave-switch
 	case 1: // leave-switch-matched
-		goto Done
+		goto Done // leave-switch-matched-body
 	case 2: // leave-switch-unmatched
-		return -1
+		return -1 // leave-switch-unmatched-body
 	}
 Done:
 	return 7
@@ -330,9 +325,9 @@ func LeaveTypeSwitch() int {
 Dispatch:
 	switch any(1).(type) { // leave-type
 	case int: // leave-type-matched
-		goto Done
+		goto Done // leave-type-matched-body
 	case string: // leave-type-unmatched
-		return -1
+		return -1 // leave-type-unmatched-body
 	}
 Done:
 	return 8
@@ -343,10 +338,10 @@ func LabelledSwitchBreak() int {
 Dispatch:
 	switch 1 { // break-switch
 	case 1: // break-switch-matched
-		total++
+		total++ // break-switch-matched-body
 		break Dispatch
 	default: // break-switch-default
-		total += 100
+		total += 100 // break-switch-default-body
 	}
 	passes++
 	if passes == 1 {
@@ -373,31 +368,31 @@ func TestSwitches(t *testing.T) {
 	points := f.success(t, "-timeout", "15s")
 	file := f.path("goto.go")
 	for _, tc := range []struct {
-		header, matched, unmatched, construct string
-		noMatch                               bool
+		header, matchedBody, unmatchedBody, construct string
+		noMatch                                       bool
 	}{
-		{"// switch-reentry", "// switch-matched", "// switch-unmatched", "switch", false},
-		{"// type-reentry", "// type-matched", "// type-unmatched", "type-switch", false},
-		{"// leave-switch\n", "// leave-switch-matched", "// leave-switch-unmatched", "switch", true},
-		{"// leave-type\n", "// leave-type-matched", "// leave-type-unmatched", "type-switch", true},
+		{"// switch-reentry", "// switch-matched-body", "// switch-unmatched-body", "switch", false},
+		{"// type-reentry", "// type-matched-body", "// type-unmatched-body", "type-switch", false},
+		{"// leave-switch\n", "// leave-switch-matched-body", "// leave-switch-unmatched-body", "switch", true},
+		{"// leave-type\n", "// leave-type-matched-body", "// leave-type-unmatched-body", "type-switch", true},
 	} {
 		wantGotoStatement(t, points, file, src, tc.header, false)
 		wantBranch(t, points, file, src, tc.header, tc.construct, "no-match", tc.noMatch)
-		wantBranch(t, points, file, src, tc.matched, tc.construct, "case", false)
-		wantBranch(t, points, file, src, tc.unmatched, tc.construct, "case", true)
+		wantGotoStatement(t, points, file, src, tc.matchedBody, false)
+		wantGotoStatement(t, points, file, src, tc.unmatchedBody, true)
 	}
-	for _, tc := range []struct{ header, unmatched, construct string }{
-		{"// switch-no-match", "// switch-never-matched", "switch"},
-		{"// type-no-match", "// type-never-matched", "type-switch"},
+	for _, tc := range []struct{ header, unmatchedBody, construct string }{
+		{"// switch-no-match", "// switch-never-matched-body", "switch"},
+		{"// type-no-match", "// type-never-matched-body", "type-switch"},
 	} {
 		wantGotoStatement(t, points, file, src, tc.header, false)
 		wantBranch(t, points, file, src, tc.header, tc.construct, "no-match", false)
-		wantBranch(t, points, file, src, tc.unmatched, tc.construct, "case", true)
+		wantGotoStatement(t, points, file, src, tc.unmatchedBody, true)
 	}
 	wantGotoStatement(t, points, file, src, "// break-switch\n", false)
 	wantBranch(t, points, file, src, "// break-switch\n", "switch", "no-match", false)
-	wantBranch(t, points, file, src, "// break-switch-matched", "switch", "case", false)
-	wantBranch(t, points, file, src, "// break-switch-default", "switch", "default", true)
+	wantGotoStatement(t, points, file, src, "// break-switch-matched-body", false)
+	wantGotoStatement(t, points, file, src, "// break-switch-default-body", true)
 }
 
 func TestGotoOrdinaryStatementTargets(t *testing.T) {
@@ -427,9 +422,9 @@ func SelectTarget() int {
 Target:
 	select { // select-target
 	case value := <-ch: // select-matched
-		return value
+		return value // select-matched-body
 	default: // select-unmatched
-		return -1
+		return -1 // select-unmatched-body
 	}
 }
 func GotoTarget() int {
@@ -513,11 +508,9 @@ func TestTargets(t *testing.T) {
 	} {
 		wantGotoStatement(t, points, file, src, marker, true)
 	}
-	wantBranch(t, points, file, src, "// if-target", "if", "true", false)
 	wantBranch(t, points, file, src, "// if-target", "if", "false", true)
-	wantBranch(t, points, file, src, "// select-matched", "select", "case", false)
-	wantBranch(t, points, file, src, "// select-unmatched", "select", "default", true)
-	wantBranch(t, points, file, src, "// goto-chain-loop", "for", "entered", false)
+	wantGotoStatement(t, points, file, src, "// select-matched-body", false)
+	wantGotoStatement(t, points, file, src, "// select-unmatched-body", true)
 	wantBranch(t, points, file, src, "// goto-chain-loop", "for", "skipped", true)
 }
 
@@ -551,9 +544,9 @@ func Namespaces() int {
 Target:
 	switch passes { // namespace-switch
 	case 0: // namespace-matched
-		total += worker()
+		total += worker() // namespace-matched-body
 	case 2: // namespace-unmatched
-		total += 100
+		total += 100 // namespace-unmatched-body
 	}
 	passes++
 	if passes == 1 {
@@ -578,9 +571,8 @@ func TestNamespaces(t *testing.T) {
 	wantGotoStatement(t, points, file, src, "// nested-target", false)
 	wantGotoStatement(t, points, file, src, "// literal-loop", false)
 	wantGotoStatement(t, points, file, src, "// namespace-switch", false)
-	wantBranch(t, points, file, src, "// literal-loop", "for", "entered", false)
 	wantBranch(t, points, file, src, "// literal-loop", "for", "skipped", false)
 	wantBranch(t, points, file, src, "// namespace-switch", "switch", "no-match", false)
-	wantBranch(t, points, file, src, "// namespace-matched", "switch", "case", false)
-	wantBranch(t, points, file, src, "// namespace-unmatched", "switch", "case", true)
+	wantGotoStatement(t, points, file, src, "// namespace-matched-body", false)
+	wantGotoStatement(t, points, file, src, "// namespace-unmatched-body", true)
 }

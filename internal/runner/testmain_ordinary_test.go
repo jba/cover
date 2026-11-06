@@ -92,10 +92,10 @@ func Hook(yes bool) {
 			f := newFixture(t, files, ".")
 			nativeTestMainSelection(t)
 			points := f.success(t, "-run", "^TestMain$")
-			wantBranch(t, points, f.path("value.go"), src, "// ordinary", "if", "true", false)
 			wantBranch(t, points, f.path("value.go"), src, "// ordinary", "if", "false", true)
-			wantBranch(t, points, f.path("value.go"), src, "// hook", "if", "true", !tc.hook)
+			wantStatement(t, points, f.path("value.go"), src, "// ordinary", "return", false)
 			wantBranch(t, points, f.path("value.go"), src, "// hook", "if", "false", true)
+			wantStatement(t, points, f.path("value.go"), src, "// hook", "return", !tc.hook)
 		})
 	}
 }
@@ -122,8 +122,8 @@ func TestValue(t *testing.T) { Value(true) }
 `,
 			}, ".")
 			points := f.success(t)
-			wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "true", false)
 			wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "false", true)
+			wantStatement(t, points, f.path("value.go"), src, "if yes", "return", false)
 		})
 	}
 }

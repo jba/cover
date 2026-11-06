@@ -1,19 +1,21 @@
 package runner_test
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,21 +31,20 @@ import (
 const fixtureMod = "module example.com/fixture\n\ngo 1.24.0\n"
 
 type position struct {
-	Line   int `json:"line"`
-	Column int `json:"column"`
+	Line   int
+	Column int
 }
 
 type sourceRange struct {
-	Start position `json:"start"`
-	End   position `json:"end"`
+	Start position
+	End   position
 }
 
 type point struct {
-	File      string      `json:"file"`
-	Kind      string      `json:"kind"`
-	Construct string      `json:"construct,omitempty"`
-	Outcome   string      `json:"outcome,omitempty"`
-	Range     sourceRange `json:"range"`
+	File  string
+	Kind  string // Derived from Word, not a separate report field.
+	Word  string
+	Range sourceRange
 }
 
 type fixture struct {
@@ -144,36 +145,65 @@ func (f fixture) success(t *testing.T, args ...string) []point {
 	return decodePoints(t, out)
 }
 
-// Decoding one object per line, with unknown fields disallowed, also proves that
-// go test's diagnostics, summaries, and user output did not leak onto stdout.
+var reportRange = regexp.MustCompile(`^([1-9][0-9]*):([1-9][0-9]*)-([1-9][0-9]*):([1-9][0-9]*)$`)
+
+// Split from the right: original, unquoted filenames can contain spaces.
+func parsePointLine(text string) (point, error) {
+	var p point
+	wordSpace := strings.LastIndexByte(text, ' ')
+	if wordSpace < 0 {
+		return p, fmt.Errorf("missing report word")
+	}
+	p.Word = text[wordSpace+1:]
+	switch p.Word {
+	case "uncovered":
+		p.Kind = "statement"
+	case "skipped":
+		p.Kind = "branch"
+	default:
+		return p, fmt.Errorf("unexpected report word %q", p.Word)
+	}
+	fileAndRange := text[:wordSpace]
+	rangeSpace := strings.LastIndexByte(fileAndRange, ' ')
+	if rangeSpace < 0 {
+		return p, fmt.Errorf("missing source range")
+	}
+	p.File = fileAndRange[:rangeSpace]
+	if !filepath.IsAbs(p.File) {
+		return p, fmt.Errorf("filename is not an unquoted absolute path: %q", p.File)
+	}
+	parts := reportRange.FindStringSubmatch(fileAndRange[rangeSpace+1:])
+	if parts == nil {
+		return p, fmt.Errorf("invalid line:column-line:column range")
+	}
+	values := make([]int, 4)
+	for i, text := range parts[1:] {
+		n, err := strconv.Atoi(text)
+		if err != nil {
+			return p, err
+		}
+		values[i] = n
+	}
+	p.Range = sourceRange{Start: position{values[0], values[1]}, End: position{values[2], values[3]}}
+	return p, nil
+}
+
+// Strict decoding also proves that JSON, other branch outcomes, go test's
+// diagnostics, summaries, and user output did not leak onto stdout.
 func decodePoints(t *testing.T, output string) []point {
 	t.Helper()
+	if output == "" {
+		return nil
+	}
+	if !strings.HasSuffix(output, "\n") {
+		t.Fatalf("report lacks its final newline: %q", output)
+	}
 	var points []point
 	seen := map[point]bool{}
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for line := 1; scanner.Scan(); line++ {
-		text := scanner.Text()
-		if strings.TrimSpace(text) == "" {
-			t.Fatalf("blank stdout line %d, expected JSONL: %q", line, output)
-		}
-		dec := json.NewDecoder(strings.NewReader(text))
-		dec.DisallowUnknownFields()
-		var p point
-		if err := dec.Decode(&p); err != nil {
-			t.Fatalf("stdout line %d is not a coverage point: %v\n%s", line, err, text)
-		}
-		var extra any
-		if err := dec.Decode(&extra); err != io.EOF {
-			t.Fatalf("stdout line %d has trailing content: %q", line, text)
-		}
-		if p.Kind != "statement" && p.Kind != "branch" {
-			t.Fatalf("unexpected point kind %q: %+v", p.Kind, p)
-		}
-		if p.Kind == "branch" && (p.Construct == "" || p.Outcome == "") {
-			t.Fatalf("branch lacks construct/outcome: %+v", p)
-		}
-		if !filepath.IsAbs(p.File) {
-			t.Fatalf("coverage filename is not an original absolute path: %+v", p)
+	for i, text := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+		p, err := parsePointLine(text)
+		if err != nil {
+			t.Fatalf("stdout line %d is not FILE START-END WORD: %v\n%q", i+1, err, text)
 		}
 		src, err := os.ReadFile(p.File)
 		if err != nil {
@@ -196,9 +226,6 @@ func decodePoints(t *testing.T, output string) []point {
 		seen[p] = true
 		points = append(points, p)
 	}
-	if err := scanner.Err(); err != nil {
-		t.Fatal(err)
-	}
 	return points
 }
 
@@ -210,22 +237,90 @@ func sourceLine(t *testing.T, src, uniqueText string) int {
 	return 1 + strings.Count(src[:strings.Index(src, uniqueText)], "\n")
 }
 
-// want reports whether this obligation should be in the *uncovered* output.
-// Never assert exact statement totals: those may evolve independently of the
-// observable branch contract.
+// wantBranch checks only decisions with reportable missing outcomes.
 func wantBranch(t *testing.T, points []point, file, src, marker, construct, outcome string, want bool) {
 	t.Helper()
-	line := sourceLine(t, src, marker)
+	switch construct + "/" + outcome {
+	case "if/false", "for/skipped", "switch/no-match", "type-switch/no-match":
+	default:
+		t.Fatalf("unsupported reported branch %s/%s", construct, outcome)
+	}
+	line := sourceLine(t, src, marker) // Also checks marker uniqueness.
+	markerOffset := strings.Index(src, marker)
+	fset := token.NewFileSet()
+	tree, err := parser.ParseFile(fset, file, src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Select the nearest preceding decision on the marker's physical line.
+	// Exact AST ranges distinguish adjacent decisions on the same line.
+	var start, end token.Pos
+	ast.Inspect(tree, func(n ast.Node) bool {
+		var first, last token.Pos
+		switch n := n.(type) {
+		case *ast.IfStmt:
+			if construct == "if" {
+				first, last = n.Cond.Pos(), n.Cond.End()
+			}
+		case *ast.ForStmt:
+			if construct == "for" {
+				first, last = n.Pos(), n.Body.Lbrace
+			}
+		case *ast.RangeStmt:
+			if construct == "for" {
+				first, last = n.Pos(), n.Body.Lbrace
+			}
+		case *ast.SwitchStmt:
+			if construct == "switch" {
+				first, last = n.Pos(), n.Body.Lbrace
+			}
+		case *ast.TypeSwitchStmt:
+			if construct == "type-switch" {
+				first, last = n.Pos(), n.Body.Lbrace
+			}
+		}
+		if first.IsValid() && fset.PositionFor(n.Pos(), false).Line == line &&
+			fset.PositionFor(n.Pos(), false).Offset <= markerOffset && first > start {
+			start, end = first, last
+		}
+		return true
+	})
+	if !start.IsValid() {
+		t.Fatalf("no %s decision at marker %q", construct, marker)
+	}
+	a, b := fset.PositionFor(start, false), fset.PositionFor(end, false)
+	wantRange := sourceRange{Start: position{a.Line, a.Column}, End: position{b.Line, b.Column}}
 	var found []point
 	for _, p := range points {
-		if p.File == file && p.Kind == "branch" && p.Construct == construct &&
-			p.Outcome == outcome && p.Range.Start.Line == line {
+		if p.File == file && p.Kind == "branch" && p.Range == wantRange {
 			found = append(found, p)
 		}
 	}
 	if (len(found) != 0) != want || len(found) > 1 {
 		t.Errorf("%s:%d %s/%s: found %d uncovered points, want present=%v\npoints: %+v",
 			file, line, construct, outcome, len(found), want, points)
+	}
+}
+
+// wantStatement can distinguish an inline body from its decision header.
+func wantStatement(t *testing.T, points []point, file, src, marker, text string, want bool) {
+	t.Helper()
+	line := sourceLine(t, src, marker)
+	source := strings.Split(src, "\n")[line-1]
+	if strings.Count(source, text) != 1 {
+		t.Fatalf("statement %q is not unique on marker line %q", text, marker)
+	}
+	column := strings.Index(source, text) + 1
+	r := sourceRange{Start: position{line, column}, End: position{line, column + len(text)}}
+	found := 0
+	for _, p := range points {
+		if p.File == file && p.Kind == "statement" && p.Range == r {
+			found++
+		}
+	}
+	if (found != 0) != want || found > 1 {
+		t.Errorf("%s:%d %q: found %d uncovered statements, want present=%v\npoints: %+v",
+			file, line, text, found, want, points)
 	}
 }
 
@@ -268,7 +363,7 @@ import (
 )
 
 func TestOriginalIdentity(t *testing.T) {
-	fmt.Println("user output must not be JSONL")
+	fmt.Println("user output must not be coverage")
 	if got := identity.Value(identity.Token{Value: 1}); got != 42 {
 		t.Fatalf("Value = %d", got)
 	}
@@ -285,8 +380,8 @@ func Value() int { return 21 }
 `,
 	}, "main")
 	points := f.success(t)
-	wantBranch(t, points, f.path("main/identity.go"), src, "if token.Value < 0", "if", "true", true)
 	wantBranch(t, points, f.path("main/identity.go"), src, "if token.Value < 0", "if", "false", false)
+	wantGotoStatement(t, points, f.path("main/identity.go"), src, "return -1", true)
 	for _, p := range points {
 		if p.File != f.path("main/identity.go") {
 			t.Errorf("default pattern instrumented a dependency or test: %+v", p)
@@ -350,8 +445,8 @@ func TestValue(t *testing.T) {
 `, packageName, importFixture, tc.imports, tc.body, value),
 				}, ".")
 				points := f.success(t)
-				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "true", false)
 				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "false", true)
+				wantGotoStatement(t, points, f.path("value.go"), src, "return 1", false)
 			})
 		}
 	}
@@ -461,29 +556,26 @@ func TestLoops(t *testing.T) {
 	}, ".")
 	points := f.success(t)
 	for _, tc := range []struct {
-		marker           string
-		entered, skipped bool
+		marker  string
+		skipped bool
 	}{
-		{"// entered", false, true},
-		{"// skipped", true, false},
-		{"// both", false, false},
-		{"// never", true, true},
-		{"// empty", false, true},
-		{"// return", false, true},
-		{"// break", false, true},
-		{"// continue", false, true},
-		{"// outer", false, true},
-		{"// inner", false, true},
-		{"// panic-init", true, true},
-		{"// panic-condition", true, true},
+		{"// entered", true},
+		{"// skipped", false},
+		{"// both", false},
+		{"// never", true},
+		{"// empty", true},
+		{"// return", true},
+		{"// break", true},
+		{"// continue", true},
+		{"// outer", true},
+		{"// inner", true},
+		{"// panic-init", true},
+		{"// panic-condition", true},
 	} {
-		wantBranch(t, points, f.path("loops.go"), src, tc.marker, "for", "entered", tc.entered)
 		wantBranch(t, points, f.path("loops.go"), src, tc.marker, "for", "skipped", tc.skipped)
 	}
 	// An infinite loop has no structurally possible skipped obligation.
-	wantBranch(t, points, f.path("loops.go"), src, "for { // infinite\n", "for", "entered", false)
 	wantBranch(t, points, f.path("loops.go"), src, "for { // infinite\n", "for", "skipped", false)
-	wantBranch(t, points, f.path("loops.go"), src, "// infinite-never", "for", "entered", true)
 	wantBranch(t, points, f.path("loops.go"), src, "// infinite-never", "for", "skipped", false)
 }
 
@@ -604,32 +696,33 @@ func TestRanges(t *testing.T) {
 	}, ".")
 	points := f.success(t)
 	for _, tc := range []struct {
-		marker           string
-		entered, skipped bool
+		marker  string
+		skipped bool
 	}{
-		{"// slice", false, true},
-		{"// map", true, false},
-		{"// string", false, true},
-		{"// integer", true, false},
-		{"// channel", false, true},
-		{"// iterator", false, true},
-		{"// empty-range", false, true},
-		{"// range-both", false, false},
-		{"// range-return", false, true},
-		{"// range-outer", false, true},
-		{"// range-inner", false, true},
-		{"// range-panic", true, true},
-		{"// range-nil-array", false, true},
+		{"// slice", true},
+		{"// map", false},
+		{"// string", true},
+		{"// integer", false},
+		{"// channel", true},
+		{"// iterator", true},
+		{"// empty-range", true},
+		{"// range-both", false},
+		{"// range-return", true},
+		{"// range-outer", true},
+		{"// range-inner", true},
+		{"// range-panic", true},
+		{"// range-nil-array", true},
 	} {
-		wantBranch(t, points, f.path("range.go"), src, tc.marker, "for", "entered", tc.entered)
 		wantBranch(t, points, f.path("range.go"), src, tc.marker, "for", "skipped", tc.skipped)
 	}
 }
 
-func TestJSONSourcePositions(t *testing.T) {
+func TestTextSourcePositions(t *testing.T) {
 	// The non-ASCII identifier makes byte columns distinguishable from rune
 	// columns; the tab must count as one byte, not as an editor's tab width.
+	// A line directive must not replace physical positions or original paths.
 	const src = `package fixture
+//line generated.go:900
 func Positive(é int) bool {
 	if é > 0 {
 		return true
@@ -649,13 +742,12 @@ func TestPosition(t *testing.T) {
 	}, ".")
 	points := f.success(t)
 	wantBranch(t, points, f.path("position.go"), src, "if é > 0", "if", "false", true)
-	wantBranch(t, points, f.path("position.go"), src, "if é > 0", "if", "true", false)
 	line := sourceLine(t, src, "if é > 0")
 	coveredReturn := sourceLine(t, src, "return true")
 	uncoveredReturn := sourceLine(t, src, "return false")
 	foundUncoveredReturn := false
 	for _, p := range points {
-		if p.Kind == "branch" && p.Construct == "if" && p.Range.Start.Line == line {
+		if p.Kind == "branch" && p.Range.Start.Line == line {
 			want := sourceRange{Start: position{Line: line, Column: 5}, End: position{Line: line, Column: 11}}
 			if p.Range != want {
 				t.Errorf("condition range = %+v, want byte-column range %+v", p.Range, want)
@@ -675,6 +767,163 @@ func TestPosition(t *testing.T) {
 	}
 	if !foundUncoveredReturn {
 		t.Error("uncovered return statement missing from report")
+	}
+}
+
+func TestTextReportFormatAndSupportedOutcomes(t *testing.T) {
+	const src = `package fixture
+
+func Exercise(yes bool, n int, value any) int {
+	total := 0
+	if yes {
+		total++
+	} else {
+		total += 100
+	}
+	if !yes {
+		total += 200
+	}
+	for i := 0; i < n; i++ {
+		total++
+	}
+	for range 0 {
+		total += 300
+	}
+	switch n {
+	case 1:
+		total++
+	case 2:
+		total += 400
+	}
+	switch n {
+	case 2:
+		total += 500
+	}
+	switch value.(type) {
+	case int:
+		total++
+	case string:
+		total += 600
+	}
+	switch value.(type) {
+	case string:
+		total += 700
+	}
+	switch n {
+	case 1:
+		total++
+	default:
+		total += 800
+	}
+	select {
+	default:
+		total++
+	case <-make(chan int):
+		total += 900
+	}
+	return total
+}
+`
+	f := newFixture(t, map[string]string{
+		"module with spaces/go.mod":         fixtureMod,
+		"module with spaces/source file.go": src,
+		"module with spaces/source_test.go": `package fixture
+import (
+	"fmt"
+	"testing"
+)
+func TestExercise(t *testing.T) {
+	fmt.Println("user output must stay off the report")
+	if got := Exercise(true, 1, 1); got != 6 { t.Fatalf("Exercise = %d, want 6", got) }
+}
+`,
+	}, "module with spaces")
+	out, diagnostic, err := f.run(t)
+	if err != nil {
+		t.Fatalf("Run: %v\nstderr:\n%s\nstdout:\n%s", err, diagnostic, out)
+	}
+	file := f.path("module with spaces/source file.go")
+	// This complete report is deliberately literal: no JSON, quoted filename,
+	// extra fields, redundant outcomes, or missing body statements may pass.
+	var want strings.Builder
+	for _, suffix := range []string{
+		"5:5-5:8 skipped",      // Missing if/false.
+		"8:3-8:15 uncovered",   // Else body.
+		"11:3-11:15 uncovered", // Missing true is represented by its body only.
+		"13:2-13:25 skipped",   // Missing for/skipped.
+		"17:3-17:15 uncovered", // Missing entered is represented by its body only.
+		"19:2-19:11 skipped",   // Missing switch/no-match.
+		"23:3-23:15 uncovered", // Missing case body.
+		"27:3-27:15 uncovered", // Actual no-match is covered.
+		"29:2-29:22 skipped",   // Missing type-switch/no-match.
+		"33:3-33:15 uncovered", // Missing type case body.
+		"37:3-37:15 uncovered", // Actual type no-match is covered.
+		"43:3-43:15 uncovered", // Missing default has only a body point, no no-match.
+		"49:3-49:15 uncovered", // Missing select outcome has only a body point.
+	} {
+		fmt.Fprintf(&want, "%s %s\n", file, suffix)
+	}
+	if out != want.String() {
+		t.Errorf("report =\n%s\nwant exactly:\n%s", out, want.String())
+	}
+	decodePoints(t, out) // Validate original files and physical byte ranges too.
+}
+
+func TestTextReportAdjacentDecisions(t *testing.T) {
+	const src = `package fixture
+func Decisions(yes bool) { if yes {}; if !yes {} }
+`
+	f := newFixture(t, map[string]string{
+		"go.mod":      fixtureMod,
+		"decision.go": src,
+		"decision_test.go": `package fixture
+import "testing"
+func TestDecisions(t *testing.T) { Decisions(true) }
+`,
+	}, ".")
+	points := f.success(t)
+	wantBranch(t, points, f.path("decision.go"), src, "if yes", "if", "false", true)
+	wantBranch(t, points, f.path("decision.go"), src, "if !yes", "if", "false", false)
+	if len(points) != 1 {
+		t.Errorf("empty bodies must not leak a missing true outcome: %+v", points)
+	}
+}
+
+func TestParsePointLine(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "space in filename.go")
+	for _, word := range []string{"uncovered", "skipped"} {
+		text := file + " 2:3-4:5 " + word
+		p, err := parsePointLine(text)
+		if err != nil || p.File != file || p.Word != word ||
+			p.Range != (sourceRange{Start: position{2, 3}, End: position{4, 5}}) {
+			t.Errorf("parsePointLine(%q) = %+v, %v", text, p, err)
+		}
+	}
+	for _, text := range []string{
+		"", `{"file":"original.go","kind":"statement"}`,
+		`"` + file + `" 1:1-1:2 uncovered`,
+		"relative.go 1:1-1:2 uncovered",
+		file + " 1:1-1:2 statement",
+		file + " 1:1-1:2 true",
+		file + " 1:1-1:2 entered",
+		file + " 1:1-1:2 case",
+		file + " 1:1-1:2 default",
+		file + " 1:1-1:2 no-match",
+		file + " 1:1-1:2 skipped extra",
+		file + " 1:1-1:2 skipped ",
+		file + " 1:1-1:2 skipped\r",
+		file + " 1:1-1:2  skipped",
+		file + " 1:1-1:2\tuncovered",
+		file + " 0:1-1:2 uncovered",
+		file + " 01:1-1:2 uncovered",
+		file + " 1:0-1:2 uncovered",
+		file + " 1:1-2:0 uncovered",
+		file + " 1:1:1:2 uncovered",
+		file + " 1:1 - 1:2 uncovered",
+	} {
+		if p, err := parsePointLine(text); err == nil {
+			t.Errorf("accepted malformed report %q: %+v", text, p)
+		}
 	}
 }
 
@@ -752,7 +1001,7 @@ func TestNotSelected(t *testing.T) { t.Fatal("-run was not passed through") }
 	}, ".")
 	countDir := t.TempDir()
 	t.Setenv("COVER_FIXTURE_COUNTS", countDir)
-	outputFile := filepath.Join(t.TempDir(), "uncovered.jsonl")
+	outputFile := filepath.Join(t.TempDir(), "uncovered.txt")
 	out, diagnostic, err := f.run(t, "-run", "^TestSelected$", "-count", "2",
 		"-timeout", "30s", "-tags", "coverfixture", "-o", outputFile, "./...")
 	if err != nil {
@@ -767,9 +1016,9 @@ func TestNotSelected(t *testing.T) { t.Fatal("-run was not passed through") }
 	}
 	points := decodePoints(t, string(data))
 	wantBranch(t, points, f.path("root.go"), rootSource, "if yes", "if", "false", true)
-	wantBranch(t, points, f.path("root.go"), rootSource, "if yes", "if", "true", false)
-	wantBranch(t, points, f.path("child/child.go"), childSource, "if yes", "if", "true", true)
 	wantBranch(t, points, f.path("child/child.go"), childSource, "if yes", "if", "false", false)
+	wantStatement(t, points, f.path("root.go"), rootSource, "if yes", "return 1", false)
+	wantStatement(t, points, f.path("child/child.go"), childSource, "if yes", "return 1", true)
 	for _, pkg := range []string{"root", "child"} {
 		data, err := os.ReadFile(filepath.Join(countDir, pkg))
 		if err != nil {
@@ -895,8 +1144,8 @@ func TestFailure(t *testing.T) { Value(true); %s }
 			points := decodePoints(t, out)
 			if tc.name == "failure" {
 				// t.Fatal still lets m.Run and TestMain complete normally.
-				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "true", false)
 				wantBranch(t, points, f.path("value.go"), src, "if yes", "if", "false", true)
+				wantStatement(t, points, f.path("value.go"), src, "if yes", "return 1", false)
 			}
 			// A timeout may bypass TestMain's save. Only require a valid
 			// partial report, not recovery of the interrupted test's hits.
@@ -976,12 +1225,9 @@ func TestConcurrent(t *testing.T) { Exercise() }
 			}
 			points := f.success(t, args...)
 			for _, marker := range []string{"// concurrent-loop", "// worker-loop"} {
-				wantBranch(t, points, f.path("concurrent.go"), src, marker, "for", "entered", false)
 				wantBranch(t, points, f.path("concurrent.go"), src, marker, "for", "skipped", true)
 			}
-			for _, outcome := range []string{"true", "false"} {
-				wantBranch(t, points, f.path("concurrent.go"), src, "if (i+j)%2 == 0", "if", outcome, false)
-			}
+			wantBranch(t, points, f.path("concurrent.go"), src, "if (i+j)%2 == 0", "if", "false", false)
 		})
 	}
 }
