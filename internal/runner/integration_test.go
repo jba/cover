@@ -1176,7 +1176,7 @@ func TestUnsupportedGoTestFlags(t *testing.T) {
 		"go.mod":   fixtureMod,
 		"value.go": "package fixture\nfunc Value() int { return 1 }\n",
 	}, ".")
-	for _, flag := range []string{"-v", "-bench", "-not-a-cover-flag"} {
+	for _, flag := range []string{"-bench", "-not-a-cover-flag"} {
 		t.Run(flag, func(t *testing.T) {
 			out, _, err := f.run(t, flag)
 			if err == nil {

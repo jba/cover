@@ -29,11 +29,13 @@ type options struct {
 	tags    string
 	race    bool
 	raceSet bool
+	verbose bool
 }
 
 // Run instruments the requested packages, runs their tests, and writes lines of
 // "FILE START END WORD" to stdout (or the file named by -o). All go command output
-// is sent to stderr. Coverage is reported even if the tests fail.
+// is sent to stderr. With -v, each record is followed by full source lines.
+// Coverage is reported even if the tests fail.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var opts options
 	flags := flag.NewFlagSet("cover", flag.ContinueOnError)
@@ -44,6 +46,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags.StringVar(&opts.timeout, "timeout", "", "test timeout, as a Go duration (default go test timeout)")
 	flags.StringVar(&opts.tags, "tags", "", "comma-separated build tags")
 	flags.BoolVar(&opts.race, "race", false, "enable the Go race detector")
+	flags.BoolVar(&opts.verbose, "v", false, "display full source lines below each report entry")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: cover [flags] [packages]")
 		flags.PrintDefaults()
@@ -52,7 +55,9 @@ Output: FILE START END WORD
   FILE is the original absolute source path.
   START and END are 1-based line:byte-column positions; END is exclusive.
   WORD is "uncovered" for a statement that never executed, or "skipped" for
-  an unobserved if-false, zero-iteration loop, or switch no-match outcome.`)
+  an unobserved if-false, zero-iteration loop, or switch no-match outcome.
+  With -v, full source lines from START through END (inclusive) follow each
+  record, ignoring columns and indented by four spaces.`)
 	}
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -174,7 +179,7 @@ Output: FILE START END WORD
 
 	// Do not return on a test failure before reading snapshots from binaries
 	// that completed TestMain. Abnormal exits may leave no snapshot.
-	reportErr := writeReport(covered, opts.output, stdout)
+	reportErr := writeReport(covered, opts.output, stdout, opts.verbose)
 	return errors.Join(testErr, reportErr)
 }
 
@@ -355,20 +360,20 @@ func uniquePrefix(source []byte) (string, error) {
 	}
 }
 
-func writeReport(packages []packageCoverage, outputPath string, stdout io.Writer) error {
+func writeReport(packages []packageCoverage, outputPath string, stdout io.Writer, verbose bool) error {
 	w := stdout
 	if outputPath != "" && outputPath != "-" {
 		f, err := os.Create(outputPath)
 		if err != nil {
 			return fmt.Errorf("create coverage output: %w", err)
 		}
-		reportErr := encodeReport(packages, f)
+		reportErr := encodeReport(packages, f, verbose)
 		return errors.Join(reportErr, f.Close())
 	}
-	return encodeReport(packages, w)
+	return encodeReport(packages, w, verbose)
 }
 
-func encodeReport(packages []packageCoverage, w io.Writer) error {
+func encodeReport(packages []packageCoverage, w io.Writer, verbose bool) error {
 	var uncovered []instrument.Point
 	for _, pkg := range packages {
 		counts, err := readCounters(pkg.countDir, pkg.count)
@@ -399,14 +404,57 @@ func encodeReport(packages []packageCoverage, w io.Writer) error {
 			strings.Compare(reportWord(a), reportWord(b)),
 		)
 	})
+	var sources map[string][][]byte
+	if verbose {
+		sources = make(map[string][][]byte)
+	}
 	for _, point := range uncovered {
+		var lines [][]byte
+		if verbose {
+			var err error
+			lines, err = sourceRangeLines(point, sources)
+			if err != nil {
+				return err
+			}
+		}
 		if _, err := fmt.Fprintf(w, "%s %d:%d %d:%d %s\n",
 			point.File, point.Range.Start.Line, point.Range.Start.Column,
 			point.Range.End.Line, point.Range.End.Column, reportWord(point)); err != nil {
 			return fmt.Errorf("write coverage output: %w", err)
 		}
+		for _, line := range lines {
+			if _, err := fmt.Fprintf(w, "    %s\n", bytes.TrimSuffix(line, []byte("\r"))); err != nil {
+				return fmt.Errorf("write coverage source: %w", err)
+			}
+		}
 	}
 	return nil
+}
+
+// sourceRangeLines ignores columns, including the exclusive end column: the
+// complete start and end lines are both displayed. Cache each original file so
+// overlapping ranges do not repeatedly read it.
+func sourceRangeLines(point instrument.Point, sources map[string][][]byte) ([][]byte, error) {
+	lines, ok := sources[point.File]
+	if !ok {
+		data, err := os.ReadFile(point.File)
+		if err != nil {
+			return nil, fmt.Errorf("read coverage source %s: %w", point.File, err)
+		}
+		lines = bytes.Split(data, []byte("\n"))
+		// A final newline terminates the last physical line; it does not
+		// create another. An empty file likewise has no source lines.
+		if len(lines[len(lines)-1]) == 0 {
+			lines = lines[:len(lines)-1]
+		}
+		sources[point.File] = lines
+	}
+	start, end := point.Range.Start.Line, point.Range.End.Line
+	if start < 1 || end < start || end > len(lines) {
+		return nil, fmt.Errorf("%s: invalid source line range %d-%d (file has %d lines)",
+			point.File, start, end, len(lines))
+	}
+	return lines[start-1 : end], nil
 }
 
 // Other branch outcomes are represented by statement coverage of their bodies,

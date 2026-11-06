@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -43,7 +44,7 @@ func TestReport(t *testing.T) {
 	}
 	packages := []packageCoverage{{countDir: counterDir, count: 4, points: points}}
 	var buf bytes.Buffer
-	if err := encodeReport(packages, &buf); err != nil {
+	if err := encodeReport(packages, &buf, false); err != nil {
 		t.Fatal(err)
 	}
 	want := fmt.Sprintf("%s 2:1 2:2 uncovered\n%s 1:1 1:2 uncovered\n%s 3:1 3:2 uncovered\n",
@@ -52,27 +53,27 @@ func TestReport(t *testing.T) {
 		t.Fatalf("report = %q, want %q", got, want)
 	}
 	outPath := filepath.Join(dir, "output.txt")
-	if err := writeReport(packages, outPath, io.Discard); err != nil {
+	if err := writeReport(packages, outPath, io.Discard, false); err != nil {
 		t.Fatal(err)
 	}
 	if contents, err := os.ReadFile(outPath); err != nil || string(contents) != want {
 		t.Fatalf("output file: contents %q, err %v", contents, err)
 	}
 	buf.Reset()
-	if err := writeReport(packages, "-", &buf); err != nil || buf.String() != want {
+	if err := writeReport(packages, "-", &buf, false); err != nil || buf.String() != want {
 		t.Fatalf("stdout destination: output %q, err %v", buf.String(), err)
 	}
 	for _, counter := range []int{-1, 4} {
 		bad := slices.Clone(points)
 		bad[0].Counter = counter
 		packages[0].points = bad
-		if err := encodeReport(packages, io.Discard); err == nil {
+		if err := encodeReport(packages, io.Discard, false); err == nil {
 			t.Errorf("invalid counter %d accepted", counter)
 		}
 	}
 	packages[0].points = points
 	packages[0].count++
-	if err := encodeReport(packages, io.Discard); err == nil {
+	if err := encodeReport(packages, io.Discard, false); err == nil {
 		t.Error("invalid counter snapshot size accepted")
 	}
 }
@@ -114,7 +115,7 @@ func TestReportOutcomes(t *testing.T) {
 							End: instrument.Position{Line: 14, Column: 19}},
 					}
 					var buf bytes.Buffer
-					err := encodeReport([]packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}, &buf)
+					err := encodeReport([]packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}, &buf, false)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -156,7 +157,7 @@ func TestReportPositionOrder(t *testing.T) {
 			point(2, 2, 10, false),
 			point(2, 2, 10, true),
 		},
-	}}, &buf)
+	}}, &buf, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +179,7 @@ func TestReportRejectsNewlineFilename(t *testing.T) {
 		var buf bytes.Buffer
 		err := encodeReport([]packageCoverage{{
 			countDir: t.TempDir(), count: 1, points: []instrument.Point{p, bad},
-		}}, &buf)
+		}}, &buf, false)
 		if err == nil || !strings.Contains(err.Error(), "filename contains a newline") {
 			t.Fatalf("newline filename error = %v", err)
 		}
@@ -195,11 +196,322 @@ func TestReportWriteError(t *testing.T) {
 		countDir: path,
 		count:    1,
 		points:   []instrument.Point{{Kind: "statement", Counter: 0}},
-	}}, failingWriter{want})
+	}}, failingWriter{want}, false)
 	if !errors.Is(err, want) {
 		t.Fatalf("error = %v, want %v", err, want)
 	}
 }
+
+func TestVerboseReportSourceLines(t *testing.T) {
+	longLine := "\t" + strings.Repeat("界", 40_000) + " // longer than a Scanner token"
+	for _, tc := range []struct {
+		name, source, excerpt string
+		start, end            instrument.Position
+	}{
+		{
+			name:    "single line ignores columns",
+			source:  "\t  before := \"café 雪\"; after() // keep trailing spaces  \n",
+			start:   instrument.Position{Line: 1, Column: 5},
+			end:     instrument.Position{Line: 1, Column: 12},
+			excerpt: "    \t  before := \"café 雪\"; after() // keep trailing spaces  \n",
+		},
+		{
+			name:    "same line ignores reversed out-of-bounds columns",
+			source:  "whole original line\n",
+			start:   instrument.Position{Line: 1, Column: 999},
+			end:     instrument.Position{Line: 1, Column: 1},
+			excerpt: "    whole original line\n",
+		},
+		{
+			name:    "multiline includes column-one end and blank lines",
+			source:  "not displayed\n\tfirst()\n\n \tlast()  \nnot displayed either\n",
+			start:   instrument.Position{Line: 2, Column: 999},
+			end:     instrument.Position{Line: 4, Column: 1},
+			excerpt: "    \tfirst()\n    \n     \tlast()  \n",
+		},
+		{
+			name:    "CRLF and unterminated final line",
+			source:  "skip\r\n\tfirst()\r\n\r\n  最後()",
+			start:   instrument.Position{Line: 2, Column: 2},
+			end:     instrument.Position{Line: 4, Column: 1},
+			excerpt: "    \tfirst()\n    \n      最後()\n",
+		},
+		{
+			name:    "empty physical line",
+			source:  "\n",
+			start:   instrument.Position{Line: 1, Column: 1},
+			end:     instrument.Position{Line: 1, Column: 999},
+			excerpt: "    \n",
+		},
+		{
+			name:    "only trailing CR is stripped",
+			source:  "\tfirst\rmiddle\r\n",
+			start:   instrument.Position{Line: 1, Column: 1},
+			end:     instrument.Position{Line: 1, Column: 2},
+			excerpt: "    \tfirst\rmiddle\n",
+		},
+		{
+			name:    "very long line without final newline",
+			source:  longLine,
+			start:   instrument.Position{Line: 1, Column: 2},
+			end:     instrument.Position{Line: 1, Column: 3},
+			excerpt: "    " + longLine + "\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "original source.go")
+			if err := os.WriteFile(file, []byte(tc.source), 0600); err != nil {
+				t.Fatal(err)
+			}
+			p := instrument.Point{
+				File: file, Kind: "statement",
+				Range: instrument.Range{Start: tc.start, End: tc.end},
+			}
+			packages := []packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}
+			header := fmt.Sprintf("%s %d:%d %d:%d uncovered\n",
+				file, tc.start.Line, tc.start.Column, tc.end.Line, tc.end.Column)
+			for _, verbose := range []bool{false, true} {
+				var buf bytes.Buffer
+				if err := encodeReport(packages, &buf, verbose); err != nil {
+					t.Fatalf("verbose=%t: %v", verbose, err)
+				}
+				want := header
+				if verbose {
+					want += tc.excerpt
+				}
+				if got := buf.String(); got != want {
+					t.Errorf("verbose=%t: report = %q, want %q", verbose, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestVerboseReportRepeatedRangesAndSourceCache(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "source.go")
+	if err := os.WriteFile(file, []byte("original first\n\toriginal second\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	otherFile := filepath.Join(dir, "z-other.go")
+	if err := os.WriteFile(otherFile, []byte("different original source"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	multiline := instrument.Point{
+		File: file, Kind: "statement",
+		Range: instrument.Range{
+			Start: instrument.Position{Line: 1, Column: 2},
+			End:   instrument.Position{Line: 2, Column: 1},
+		},
+	}
+	overlap := multiline
+	overlap.Kind, overlap.Construct, overlap.Outcome = "branch", "if", "false"
+	overlap.Range.Start = instrument.Position{Line: 2, Column: 3}
+	overlap.Range.End = instrument.Position{Line: 2, Column: 8}
+	other := instrument.Point{File: otherFile, Kind: "statement", Range: instrument.Range{
+		Start: instrument.Position{Line: 1, Column: 1},
+		End:   instrument.Position{Line: 1, Column: 2},
+	}}
+	packages := []packageCoverage{
+		{countDir: dir, count: 1, points: []instrument.Point{overlap, multiline}},
+		{countDir: dir, count: 1, points: []instrument.Point{other, multiline}},
+	}
+	var buf bytes.Buffer
+	removed := false
+	w := reportWriterFunc(func(p []byte) (int, error) {
+		n, err := buf.Write(p)
+		if !removed && strings.Contains(buf.String(), "    original first\n") {
+			// Reporting must keep using its cached original source, even for
+			// another package's point with exactly the same filename.
+			if err := os.Remove(file); err != nil {
+				return n, err
+			}
+			removed = true
+		}
+		return n, err
+	})
+	if err := encodeReport(packages, w, true); err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("source excerpt was not written")
+	}
+	block := file + " 1:2 2:1 uncovered\n    original first\n    \toriginal second\n"
+	want := block + block + file + " 2:3 2:8 skipped\n    \toriginal second\n" +
+		otherFile + " 1:1 1:2 uncovered\n    different original source\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("repeated/overlapping snippets:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+func TestVerboseReportSourceErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, source string
+		start, end   int
+	}{
+		{"zero start", "one\ntwo\n", 0, 1},
+		{"negative start", "one\ntwo\n", -1, 1},
+		{"zero end", "one\ntwo\n", 1, 0},
+		{"negative end", "one\ntwo\n", 1, -1},
+		{"reversed range", "one\ntwo\n", 2, 1},
+		{"start beyond EOF", "one\ntwo\n", 3, 3},
+		{"end beyond EOF", "one\ntwo\n", 1, 3},
+		{"empty source", "", 1, 1},
+		{"no phantom line after trailing LF", "one\n", 2, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "source.go")
+			if err := os.WriteFile(file, []byte(tc.source), 0600); err != nil {
+				t.Fatal(err)
+			}
+			p := instrument.Point{File: file, Kind: "statement", Range: instrument.Range{
+				Start: instrument.Position{Line: tc.start, Column: 1},
+				End:   instrument.Position{Line: tc.end, Column: 2},
+			}}
+			err := encodeReport([]packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}, io.Discard, true)
+			if err == nil || !strings.Contains(err.Error(), file) {
+				t.Errorf("invalid source range error = %v, want error naming %q", err, file)
+			}
+		})
+	}
+	for _, directory := range []bool{false, true} {
+		t.Run(fmt.Sprintf("read failure/directory=%t", directory), func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "missing.go")
+			if directory {
+				file = dir
+			}
+			p := instrument.Point{File: file, Kind: "statement", Range: instrument.Range{
+				Start: instrument.Position{Line: 1, Column: 1},
+				End:   instrument.Position{Line: 1, Column: 2},
+			}}
+			packages := []packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}
+			// Default reporting never needs to open a referenced source file.
+			if err := encodeReport(packages, io.Discard, false); err != nil {
+				t.Fatalf("nonverbose reporting tried to read source: %v", err)
+			}
+			err := encodeReport(packages, io.Discard, true)
+			if err == nil || !strings.Contains(err.Error(), file) {
+				t.Fatalf("source-read error = %v, want error naming %q", err, file)
+			}
+			if !directory && !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("source-read error lost os.ErrNotExist: %v", err)
+			}
+		})
+	}
+}
+
+func TestVerboseReportOmittedPointsDoNotReadSource(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "123.json"), []byte("[1,0]"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// All paths are deliberately absent, and all line bounds invalid. Neither
+	// source reads nor range validation are needed for records not displayed.
+	points := []instrument.Point{
+		{Kind: "statement", Counter: 0},
+		{Kind: "branch", Construct: "if", Outcome: "false", Counter: 0},
+		{Kind: "branch", Construct: "for", Outcome: "skipped", Counter: 0},
+		{Kind: "branch", Construct: "switch", Outcome: "no-match", Counter: 0},
+		{Kind: "branch", Construct: "type-switch", Outcome: "no-match", Counter: 0},
+	}
+	for _, outcome := range []struct{ construct, outcome string }{
+		{"if", "true"}, {"for", "entered"},
+		{"switch", "case"}, {"switch", "default"},
+		{"type-switch", "case"}, {"type-switch", "default"},
+		{"select", "case"}, {"select", "default"},
+	} {
+		points = append(points, instrument.Point{
+			Kind: "branch", Construct: outcome.construct, Outcome: outcome.outcome, Counter: 1,
+		})
+	}
+	for i := range points {
+		points[i].File = filepath.Join(dir, fmt.Sprintf("missing-%d.go", i))
+	}
+	var buf bytes.Buffer
+	if err := encodeReport([]packageCoverage{{countDir: dir, count: 2, points: points}}, &buf, true); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("covered/ignored points produced snippets or headers: %q", &buf)
+	}
+}
+
+func TestVerboseReportSourceWriteErrors(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "source.go")
+	if err := os.WriteFile(file, []byte("first\nsecond\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := instrument.Point{File: file, Kind: "statement", Range: instrument.Range{
+		Start: instrument.Position{Line: 1, Column: 1},
+		End:   instrument.Position{Line: 2, Column: 1},
+	}}
+	header := file + " 1:1 2:1 uncovered\n"
+	wantErr := errors.New("source writer failed")
+	// Fail at the prefix, within a prefix, within source content, at its LF,
+	// and on the following line, after the header has succeeded in full.
+	for _, extra := range []int{0, 2, 4, 6, len("    first"), len("    first\n")} {
+		t.Run(fmt.Sprintf("after %d source bytes", extra), func(t *testing.T) {
+			remaining := len(header) + extra
+			w := reportWriterFunc(func(p []byte) (int, error) {
+				if len(p) > remaining {
+					n := remaining
+					remaining = 0
+					return n, wantErr
+				}
+				remaining -= len(p)
+				return len(p), nil
+			})
+			err := encodeReport([]packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}, w, true)
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("source writing error = %v, want %v", err, wantErr)
+			}
+		})
+	}
+}
+
+func TestVerboseReportOutputDestinations(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "source.go")
+	if err := os.WriteFile(file, []byte("\treturn 42"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := instrument.Point{File: file, Kind: "statement", Range: instrument.Range{
+		Start: instrument.Position{Line: 1, Column: 2},
+		End:   instrument.Position{Line: 1, Column: 11},
+	}}
+	packages := []packageCoverage{{countDir: dir, count: 1, points: []instrument.Point{p}}}
+	want := file + " 1:2 1:11 uncovered\n    \treturn 42\n"
+	for _, outputPath := range []string{"", "-", filepath.Join(dir, "report.txt")} {
+		t.Run(fmt.Sprintf("output=%q", outputPath), func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := writeReport(packages, outputPath, &buf, true); err != nil {
+				t.Fatal(err)
+			}
+			got := buf.String()
+			if outputPath != "" && outputPath != "-" {
+				if got != "" {
+					t.Errorf("file destination leaked report to stdout: %q", got)
+				}
+				data, err := os.ReadFile(outputPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = string(data)
+			}
+			if got != want {
+				t.Errorf("report = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+type reportWriterFunc func([]byte) (int, error)
+
+func (f reportWriterFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestReadCounters(t *testing.T) {
 	dir := t.TempDir()
@@ -272,6 +584,15 @@ func TestRunFlags(t *testing.T) {
 		} {
 			if !strings.Contains(diagnostic.String(), text) {
 				t.Errorf("%s output lacks %q:\n%s", help, text, &diagnostic)
+			}
+		}
+		if !regexp.MustCompile(`(?m)^  -v(?:\s|$)`).MatchString(diagnostic.String()) {
+			t.Errorf("%s output lacks the -v flag:\n%s", help, &diagnostic)
+		}
+		helpText := strings.ToLower(diagnostic.String())
+		for _, text := range []string{"full source lines", "inclusive", "four spaces", "ignoring columns"} {
+			if !strings.Contains(helpText, text) {
+				t.Errorf("%s output does not describe verbose source display (%q):\n%s", help, text, &diagnostic)
 			}
 		}
 	}

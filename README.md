@@ -25,6 +25,7 @@ Requires Go 1.26 or later and module mode. The runtime is pure Go; Linux is test
 go install github.com/jba/cover@latest
 cover ./... > uncovered.txt
 cover -run TestParse -race -o uncovered.txt ./parser
+cover -v ./parser
 ```
 
 From a checkout, use `go run . [flags] [packages]`. Package patterns default to
@@ -39,6 +40,7 @@ From a checkout, use `go run . [flags] [packages]`. Package patterns default to
 -timeout d    Forward a test timeout, e.g. 30s
 -tags tags    Build tags, applied to package discovery and testing
 -race         Enable Go's race detector for discovery and testing
+-v            Display full source lines below each report entry
 ```
 
 Existing `GOFLAGS` and Go environment settings remain in effect. The tool
@@ -50,7 +52,7 @@ tests still run and can exercise the selected production packages.
 ## Output
 
 Only uncovered points are emitted. Test output and diagnostics go to stderr;
-stdout contains only report lines unless `-o` names an output file. Each line is:
+stdout contains the report unless `-o` names an output file. Each report entry is:
 
 ```text
 FILE START END WORD
@@ -79,6 +81,20 @@ For example:
   range identifies the condition or header, not an invented empty body.
 - Uncovered body statements are reported independently; overlapping ranges are
   intentional. Results are sorted by filename, source position, and word.
+
+With `-v`, each entry is immediately followed by the original source lines from
+its start line through its end line, inclusive, each prefixed with four spaces:
+
+```text
+/repo/foo.go 11:8 11:13 skipped
+        if n < 0 {
+```
+
+Columns are ignored when displaying source: complete lines are shown, including
+the end line even when its column is 1. Original indentation and blank lines are
+preserved; CRLF line endings are displayed as LF. Overlapping entries repeat
+their source lines. `-o` includes these excerpts too. This flag does not enable
+`go test -v`; omit it (or use `-v=false`) for the record-only format.
 
 An empty report means there are no gaps under these reporting rules, **provided
 that the command succeeded**. It does not establish every possible branch
