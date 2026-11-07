@@ -198,6 +198,9 @@ Current limitations:
 
 ## Development
 
+All command code and tests live in one root-level `package main`, grouped by
+function in separate files.
+
 ```sh
 go test ./...
 go test -race ./...

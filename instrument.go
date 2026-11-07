@@ -1,5 +1,5 @@
-// Package instrument adds coverage bookkeeping without relocating source files.
-package instrument
+// Source instrumentation adds coverage bookkeeping without relocating files.
+package main
 
 import (
 	"bytes"

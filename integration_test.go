@@ -1,4 +1,4 @@
-package runner_test
+package main
 
 import (
 	"bytes"
@@ -19,8 +19,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/jba/cover/internal/runner"
 )
 
 // These tests deliberately use real, independent modules. In particular, testing
@@ -116,7 +114,7 @@ func (f fixture) run(t *testing.T, args ...string) (stdout, stderr string, err e
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	var out, diagnostic bytes.Buffer
-	err = runner.Run(ctx, args, &out, &diagnostic)
+	err = Run(ctx, args, &out, &diagnostic)
 	after := snapshot(t, f.root)
 	if !reflect.DeepEqual(before, after) {
 		var changed []string

@@ -1,8 +1,9 @@
 # Implementation contract
 
-Module github.com/jba/cover. CLI at the module root. No external dependencies.
+Module github.com/jba/cover. All code and tests are in package main at the module
+root. No internal packages or external dependencies.
 
-Internal package `internal/instrument` exports:
+`instrument.go` defines source instrumentation and coverage metadata:
 - Position {Line int `json:"line"`; Column int `json:"column"`}
 - Range {Start Position `json:"start"`; End Position `json:"end"`}
 - Point {File string `json:"file"`; Kind string `json:"kind"`; Construct string `json:"construct,omitempty"`; Outcome string `json:"outcome,omitempty"`; Range Range `json:"range"`; Counter int `json:"-"`}
@@ -10,7 +11,7 @@ Internal package `internal/instrument` exports:
 
 prefix is a valid reserved-ish identifier prefix unique to this package, e.g. __cover_a1b2. Instrumentation references prefix+"Hit"(counterID) and prefix+"Bool"(trueID,falseID, bool-expression) (a generic ~bool-preserving helper). Counters increment (not set), using in-memory atomic.Uint64 values in a per-package runtime supplied by CLI. IDs allocate by incrementing *nextCounter, zero-based.
 
-CLI at internal/runner, exported Run(ctx context.Context, args []string, stdout, stderr io.Writer) error. Root main.go just invokes runner.Run. Flags -o filename (default stdout text report), -run, -count (default 1), -timeout, -tags, -race, -v (show source excerpts). Positional package patterns default '.'; list packages via go list -json and instrument their non-test GoFiles/CgoFiles only. Compile rewritten sources through go test -overlay with virtual generated runtime Go file added inside each original package directory. Never copy modules or modify source. Tests' output to stderr, stdout exclusively the coverage report.
+CLI implementation in runner.go, Run(ctx context.Context, args []string, stdout, stderr io.Writer) error. main.go just invokes Run. Generated runtime and registry code remain in runtime.go and registry.go; TestMain rewriting remains in testmain.go. Tests retain their filenames, with the former two goto_test.go files combined into one. Flags -o filename (default stdout text report), -run, -count (default 1), -timeout, -tags, -race, -v (show source excerpts). Positional package patterns default '.'; list packages via go list -json and instrument their non-test GoFiles/CgoFiles only. Compile rewritten sources through go test -overlay with virtual generated runtime Go file added inside each original package directory. Never copy modules or modify source. Tests' output to stderr, stdout exclusively the coverage report.
 
 Report format: one `FILE START END WORD` record per missing reported obligation, where FILE is the unquoted absolute original-source filename and START/END are physical 1-based line:byte-column positions, exclusive end. Parse the last three space-delimited fields from the right to support filenames containing spaces. Reject filenames containing CR/LF rather than emitting malformed records. WORD is `uncovered` for statement points, or `skipped` for if/false, for/skipped, and switch or type-switch/no-match. Other internal branch outcomes are not printed; nonempty bodies are represented by their statement points. Empty bodies have no statement records. Sort by filename, start/end position, and word. Internal point metadata and atomic-counter snapshots are unchanged; JSON is used for snapshots and overlays, not the public report.
 

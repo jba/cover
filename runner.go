@@ -1,5 +1,5 @@
-// Package runner implements the cover command.
-package runner
+// Test execution and coverage reporting for the cover command.
+package main
 
 import (
 	"bytes"
@@ -17,8 +17,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-
-	"github.com/jba/cover/internal/instrument"
 )
 
 type options struct {
@@ -249,7 +247,7 @@ func isVendor(dir string) bool {
 type packageCoverage struct {
 	countDir string
 	count    int
-	points   []instrument.Point
+	points   []Point
 }
 
 func preparePackage(pkg listedPackage, tempDir, registryImport string, number int, overlay map[string]string) (packageCoverage, error) {
@@ -293,7 +291,7 @@ func preparePackage(pkg listedPackage, tempDir, registryImport string, number in
 	var nextCounter int
 	for i, name := range files {
 		path := filepath.Join(pkgDir, name)
-		rewritten, points, err := instrument.Instrument(path, originals[name], prefix, &nextCounter)
+		rewritten, points, err := Instrument(path, originals[name], prefix, &nextCounter)
 		if err != nil {
 			return result, fmt.Errorf("instrument %s: %w", path, err)
 		}
@@ -374,7 +372,7 @@ func writeReport(packages []packageCoverage, outputPath string, stdout io.Writer
 }
 
 func encodeReport(packages []packageCoverage, w io.Writer, verbose bool) error {
-	var uncovered []instrument.Point
+	var uncovered []Point
 	for _, pkg := range packages {
 		counts, err := readCounters(pkg.countDir, pkg.count)
 		if err != nil {
@@ -394,7 +392,7 @@ func encodeReport(packages []packageCoverage, w io.Writer, verbose bool) error {
 	}
 	// Instrumentation may discover nested function literals in a separate walk;
 	// present all points in original source order rather than allocation order.
-	slices.SortFunc(uncovered, func(a, b instrument.Point) int {
+	slices.SortFunc(uncovered, func(a, b Point) int {
 		return cmp.Or(
 			strings.Compare(a.File, b.File),
 			cmp.Compare(a.Range.Start.Line, b.Range.Start.Line),
@@ -434,7 +432,7 @@ func encodeReport(packages []packageCoverage, w io.Writer, verbose bool) error {
 // sourceRangeLines ignores columns, including the exclusive end column: the
 // complete start and end lines are both displayed. Cache each original file so
 // overlapping ranges do not repeatedly read it.
-func sourceRangeLines(point instrument.Point, sources map[string][][]byte) ([][]byte, error) {
+func sourceRangeLines(point Point, sources map[string][][]byte) ([][]byte, error) {
 	lines, ok := sources[point.File]
 	if !ok {
 		data, err := os.ReadFile(point.File)
@@ -459,7 +457,7 @@ func sourceRangeLines(point instrument.Point, sources map[string][][]byte) ([][]
 
 // Other branch outcomes are represented by statement coverage of their bodies,
 // not by separate records. Effectively empty bodies have no statement records.
-func reportWord(point instrument.Point) string {
+func reportWord(point Point) string {
 	if point.Kind == "statement" {
 		return "uncovered"
 	}

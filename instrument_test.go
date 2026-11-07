@@ -1,4 +1,4 @@
-package instrument
+package main
 
 import (
 	"bytes"

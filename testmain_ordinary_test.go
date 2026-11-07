@@ -1,4 +1,4 @@
-package runner_test
+package main
 
 import (
 	"os/exec"
